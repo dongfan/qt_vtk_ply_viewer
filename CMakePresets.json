@@ -1,0 +1,16 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vs2022-ninja-release",
+      "displayName": "VS2022 Ninja Release (Qt6 + VTK9.3)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "C:/dev/vtk-qt/deps/vtk-install;C:/Qt/6.10.1/msvc2022_64",
+        "VTK_DIR": "C:/dev/vtk-qt/deps/vtk-install/lib/cmake/vtk-9.3"
+      }
+    }
+  ]
+}

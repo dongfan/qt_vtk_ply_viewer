@@ -1,0 +1,78 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"jsonFile" : "directory-.-Release-d0094a50bb2071803777.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"name" : "Release",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "qt_vtk_ply_viewer",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "qt_vtk_ply_viewer::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-qt_vtk_ply_viewer-Release-5d5e3afcc1719959c998.json",
+					"name" : "qt_vtk_ply_viewer",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "qt_vtk_ply_viewer_autogen::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-qt_vtk_ply_viewer_autogen-Release-f34144a327106178deb6.json",
+					"name" : "qt_vtk_ply_viewer_autogen",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "qt_vtk_ply_viewer_autogen_timestamp_deps::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-qt_vtk_ply_viewer_autogen_timestamp_deps-Release-cc56b4183462e13e4d57.json",
+					"name" : "qt_vtk_ply_viewer_autogen_timestamp_deps",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "C:/dev/qt_vtk_ply_viewer/build",
+		"source" : "C:/dev/qt_vtk_ply_viewer"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 8
+	}
+}

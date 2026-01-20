@@ -1,0 +1,11 @@
+{
+  "name": "qt-vtk-ply-viewer",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "vtk",
+      "default-features": false,
+      "features": [ "qt" ]
+    }
+  ]
+}

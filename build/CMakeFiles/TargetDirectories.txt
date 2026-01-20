@@ -1,0 +1,5 @@
+C:/dev/qt_vtk_ply_viewer/build/CMakeFiles/qt_vtk_ply_viewer.dir
+C:/dev/qt_vtk_ply_viewer/build/CMakeFiles/edit_cache.dir
+C:/dev/qt_vtk_ply_viewer/build/CMakeFiles/rebuild_cache.dir
+C:/dev/qt_vtk_ply_viewer/build/CMakeFiles/qt_vtk_ply_viewer_autogen_timestamp_deps.dir
+C:/dev/qt_vtk_ply_viewer/build/CMakeFiles/qt_vtk_ply_viewer_autogen.dir
