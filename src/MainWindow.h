@@ -1,8 +1,38 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QObject>
+#include <QAtomicInt>
+#include <QString>
+
+#include <vtkSmartPointer.h>
 
 class QVTKOpenGLNativeWidget;
+class QLineEdit;
+class QComboBox;
+class QSlider;
+
+class vtkRenderer;
+class vtkPolyDataMapper;
+class vtkActor;
+class vtkPolyData;
+
+// Worker (moc 대상: 헤더에 둬서 자동 moc 되게 함)
+class PlyLoadWorker : public QObject
+{
+    Q_OBJECT
+public:
+    QString path;
+    QAtomicInt* cancelFlag = nullptr;
+
+signals:
+    void progress(int percent);
+    void finished(vtkPolyData* polyRaw);
+    void failed(QString msg);
+
+public slots:
+    void run();
+};
 
 class MainWindow : public QMainWindow
 {
@@ -10,15 +40,28 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget* parent = nullptr);
 
-private slots:
-    void onOpenPly();
+protected:
+    void dragEnterEvent(QDragEnterEvent* e) override;
+    void dropEvent(QDropEvent* e) override;
 
 private:
-    void setupUi();
-    void setupVtk();
+    void CreateDockUI();
+    void LoadPLYAsync(const QString& path);
+    void ApplyRenderOptions();
+    void UpdateRender();
 
-    QVTKOpenGLNativeWidget* m_vtkWidget = nullptr;
+private:
+    QVTKOpenGLNativeWidget* vtkWidget_ = nullptr;
 
-    class vtkGenericOpenGLRenderWindow* m_renderWindowRaw = nullptr;
-    class vtkRenderer* m_rendererRaw = nullptr;
+    QLineEdit* filePathEdit_ = nullptr;
+    QComboBox* modeCombo_ = nullptr;
+    QSlider* pointSizeSlider_ = nullptr;
+    QSlider* lineWidthSlider_ = nullptr;
+
+    QString currentPath_;
+    bool loading_ = false;
+
+    vtkSmartPointer<vtkRenderer> renderer_;
+    vtkSmartPointer<vtkPolyDataMapper> mapper_;
+    vtkSmartPointer<vtkActor> actor_;
 };

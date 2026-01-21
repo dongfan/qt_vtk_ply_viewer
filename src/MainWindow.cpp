@@ -1,97 +1,473 @@
 #include "MainWindow.h"
 
-#include <QMenuBar>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <QDockWidget>
+#include <QPushButton>
 #include <QFileDialog>
+#include <QLineEdit>
+#include <QLabel>
+#include <QSlider>
+#include <QComboBox>
 #include <QMessageBox>
-#include <QStatusBar>
+#include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+
+#include <QThread>
+#include <QProgressDialog>
+#include <QPointer>
+
+#include <functional>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
+#include <stdexcept>
+#include <cstring>
 
 #include <QVTKOpenGLNativeWidget.h>
 
 #include <vtkGenericOpenGLRenderWindow.h>
+#include <vtkNew.h>
 #include <vtkRenderer.h>
-#include <vtkSmartPointer.h>
 #include <vtkRenderWindowInteractor.h>
 #include <vtkInteractorStyleTrackballCamera.h>
 
 #include <vtkPLYReader.h>
 #include <vtkPolyData.h>
-#include <vtkVertexGlyphFilter.h>
 #include <vtkPolyDataMapper.h>
 #include <vtkActor.h>
 #include <vtkProperty.h>
+#include <vtkPoints.h>
+#include <vtkCellArray.h>
+#include <vtkIdTypeArray.h>
 
+namespace {
+
+    // -------------------- Safe PLY Loader (PCL binary_little_endian) --------------------
+    static vtkSmartPointer<vtkPolyData> LoadPlySafe_PCLBinary_Progress(
+        const std::string& path,
+        const std::function<void(int /*percent*/)>& onProgress,
+        const std::function<bool(void)>& isCanceled
+    )
+    {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) throw std::runtime_error("Cannot open PLY: " + path);
+
+        std::string line;
+        bool headerEnded = false;
+        bool isBinaryLE = false;
+
+        long long vertexCount = -1;
+        bool inVertexElement = false;
+
+        struct Prop { std::string type; std::string name; };
+        std::vector<Prop> vertexProps;
+
+        auto trim = [](std::string s) {
+            while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            size_t i = 0; while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+            return s.substr(i);
+            };
+
+        // --- parse header ---
+        while (std::getline(ifs, line))
+        {
+            if (isCanceled()) throw std::runtime_error("Canceled");
+
+            line = trim(line);
+            if (line.rfind("format ", 0) == 0) {
+                if (line.find("binary_little_endian") != std::string::npos) isBinaryLE = true;
+            }
+            else if (line.rfind("element vertex ", 0) == 0) {
+                vertexCount = std::stoll(line.substr(std::string("element vertex ").size()));
+                inVertexElement = true;
+                vertexProps.clear();
+            }
+            else if (line.rfind("element ", 0) == 0) {
+                if (line.rfind("element vertex ", 0) != 0) inVertexElement = false;
+            }
+            else if (inVertexElement && line.rfind("property ", 0) == 0) {
+                std::istringstream iss(line);
+                std::string tok, type, name;
+                iss >> tok >> type >> name;
+                if (!type.empty() && !name.empty()) vertexProps.push_back({ type, name });
+            }
+            else if (line == "end_header") {
+                headerEnded = true;
+                break;
+            }
+        }
+
+        if (!headerEnded) throw std::runtime_error("PLY header end_header missing");
+        if (!isBinaryLE) throw std::runtime_error("Only binary_little_endian supported by this safe loader");
+        if (vertexCount <= 0) throw std::runtime_error("Invalid vertex count");
+        if (vertexProps.empty()) throw std::runtime_error("No vertex properties in header");
+
+        auto typeSize = [](const std::string& t)->size_t {
+            if (t == "char" || t == "int8") return 1;
+            if (t == "uchar" || t == "uint8") return 1;
+            if (t == "short" || t == "int16") return 2;
+            if (t == "ushort" || t == "uint16") return 2;
+            if (t == "int" || t == "int32") return 4;
+            if (t == "uint" || t == "uint32") return 4;
+            if (t == "float" || t == "float32") return 4;
+            if (t == "double" || t == "float64") return 8;
+            return 0;
+            };
+
+        std::unordered_map<std::string, size_t> offset;
+        std::unordered_map<std::string, std::string> ptype;
+        size_t stride = 0;
+
+        for (auto& p : vertexProps) {
+            size_t sz = typeSize(p.type);
+            if (sz == 0) throw std::runtime_error("Unsupported PLY property type: " + p.type);
+            offset[p.name] = stride;
+            ptype[p.name] = p.type;
+            stride += sz;
+        }
+
+        if (!offset.count("x") || !offset.count("y") || !offset.count("z"))
+            throw std::runtime_error("PLY must contain x/y/z properties");
+
+        std::vector<unsigned char> buf(stride);
+
+        vtkNew<vtkPoints> points;
+        points->SetDataTypeToFloat();
+        points->SetNumberOfPoints(static_cast<vtkIdType>(vertexCount));
+
+        auto readFloatAt = [&](const std::string& name)->float {
+            const auto& t = ptype[name];
+            const size_t off = offset[name];
+
+            if (t == "float" || t == "float32") {
+                float v; std::memcpy(&v, buf.data() + off, sizeof(float));
+                return v;
+            }
+            if (t == "double" || t == "float64") {
+                double v; std::memcpy(&v, buf.data() + off, sizeof(double));
+                return static_cast<float>(v);
+            }
+            if (t == "int" || t == "int32") {
+                int32_t v; std::memcpy(&v, buf.data() + off, 4);
+                return static_cast<float>(v);
+            }
+            if (t == "uint" || t == "uint32") {
+                uint32_t v; std::memcpy(&v, buf.data() + off, 4);
+                return static_cast<float>(v);
+            }
+            if (t == "short" || t == "int16") {
+                int16_t v; std::memcpy(&v, buf.data() + off, 2);
+                return static_cast<float>(v);
+            }
+            if (t == "ushort" || t == "uint16") {
+                uint16_t v; std::memcpy(&v, buf.data() + off, 2);
+                return static_cast<float>(v);
+            }
+            if (t == "char" || t == "int8") {
+                int8_t v; std::memcpy(&v, buf.data() + off, 1);
+                return static_cast<float>(v);
+            }
+            if (t == "uchar" || t == "uint8") {
+                uint8_t v; std::memcpy(&v, buf.data() + off, 1);
+                return static_cast<float>(v);
+            }
+            throw std::runtime_error("Unsupported numeric type for " + name + ": " + t);
+            };
+
+        // ---- read vertices (0~90%) ----
+        for (long long i = 0; i < vertexCount; ++i) {
+            if (isCanceled()) throw std::runtime_error("Canceled");
+
+            ifs.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(stride));
+            if (!ifs) throw std::runtime_error("Unexpected EOF while reading vertices");
+
+            const float x = readFloatAt("x");
+            const float y = readFloatAt("y");
+            const float z = readFloatAt("z");
+
+            points->SetPoint(static_cast<vtkIdType>(i), x, y, z);
+
+            if ((i & 0x3FFF) == 0) {
+                int p = static_cast<int>((i * 90) / vertexCount);
+                onProgress(p);
+            }
+        }
+
+        // vertices cell array (legacy style)
+        vtkNew<vtkIdTypeArray> conn;
+        conn->SetNumberOfComponents(1);
+        conn->SetNumberOfTuples(static_cast<vtkIdType>(vertexCount) * 2);
+
+        auto* ptr = conn->WritePointer(0, static_cast<vtkIdType>(vertexCount) * 2);
+        for (long long i = 0; i < vertexCount; ++i) {
+            if (isCanceled()) throw std::runtime_error("Canceled");
+            ptr[2 * i] = 1;
+            ptr[2 * i + 1] = static_cast<vtkIdType>(i);
+
+            if ((i & 0x3FFF) == 0) {
+                int p = 90 + static_cast<int>((i * 9) / vertexCount);
+                onProgress(p);
+            }
+        }
+
+        vtkNew<vtkCellArray> verts;
+        verts->SetData(1, conn);
+
+        vtkSmartPointer<vtkPolyData> poly = vtkSmartPointer<vtkPolyData>::New();
+        poly->SetPoints(points);
+        poly->SetVerts(verts);
+
+        onProgress(99);
+        return poly;
+    }
+
+} // namespace
+
+// -------------------- PlyLoadWorker --------------------
+void PlyLoadWorker::run()
+{
+    try {
+        auto poly = LoadPlySafe_PCLBinary_Progress(
+            path.toStdString(),
+            [&](int p) { emit progress(p); },
+            [&]() { return cancelFlag && cancelFlag->loadRelaxed() != 0; }
+        );
+
+        if (!poly || poly->GetNumberOfPoints() == 0)
+            throw std::runtime_error("No points found");
+
+        vtkPolyData* raw = poly.GetPointer();
+        raw->Register(nullptr);      // refcount 1 보장해서 넘김
+        poly = nullptr;
+
+        emit finished(raw);
+    }
+    catch (const std::exception& e) {
+        emit failed(e.what());
+    }
+    catch (...) {
+        emit failed("Unknown error");
+    }
+}
+
+// -------------------- MainWindow --------------------
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
-    setupUi();
-    setupVtk();
+    setWindowTitle("Qt + VTK PLY Viewer");
+    resize(1200, 850);
+    setAcceptDrops(true);
+
+    auto* central = new QWidget(this);
+    auto* layout = new QVBoxLayout(central);
+    layout->setContentsMargins(0, 0, 0, 0);
+
+    vtkWidget_ = new QVTKOpenGLNativeWidget(central);
+    layout->addWidget(vtkWidget_);
+    setCentralWidget(central);
+
+    vtkNew<vtkGenericOpenGLRenderWindow> rw;
+    vtkWidget_->setRenderWindow(rw);
+
+    renderer_ = vtkSmartPointer<vtkRenderer>::New();
+    renderer_->SetBackground(0.15, 0.15, 0.18);
+    vtkWidget_->renderWindow()->AddRenderer(renderer_);
+
+    vtkNew<vtkInteractorStyleTrackballCamera> style;
+    vtkWidget_->renderWindow()->GetInteractor()->SetInteractorStyle(style);
+
+    mapper_ = vtkSmartPointer<vtkPolyDataMapper>::New();
+    actor_ = vtkSmartPointer<vtkActor>::New();
+    actor_->SetMapper(mapper_);
+    actor_->GetProperty()->SetInterpolationToPhong();
+    actor_->GetProperty()->SetColor(0.9, 0.9, 0.9);
+
+    renderer_->AddActor(actor_);
+
+    CreateDockUI();
+    ApplyRenderOptions();
+    UpdateRender();
 }
 
-void MainWindow::setupUi()
+void MainWindow::dragEnterEvent(QDragEnterEvent* e)
 {
-    auto* fileMenu = menuBar()->addMenu(tr("File"));
-    auto* openAct = fileMenu->addAction(tr("Open PLY..."));
-    connect(openAct, &QAction::triggered, this, &MainWindow::onOpenPly);
-
-    m_vtkWidget = new QVTKOpenGLNativeWidget(this);
-    setCentralWidget(m_vtkWidget);
+    if (e->mimeData()->hasUrls())
+        e->acceptProposedAction();
 }
 
-void MainWindow::setupVtk()
+void MainWindow::dropEvent(QDropEvent* e)
 {
-    auto renderWindow = vtkSmartPointer<vtkGenericOpenGLRenderWindow>::New();
-    m_renderWindowRaw = renderWindow;
+    const auto urls = e->mimeData()->urls();
+    if (urls.isEmpty()) return;
 
-    auto renderer = vtkSmartPointer<vtkRenderer>::New();
-    m_rendererRaw = renderer;
-
-    renderWindow->AddRenderer(renderer);
-    m_vtkWidget->setRenderWindow(renderWindow);
-
-    auto style = vtkSmartPointer<vtkInteractorStyleTrackballCamera>::New();
-    m_vtkWidget->renderWindow()->GetInteractor()->SetInteractorStyle(style);
-
-    renderer->SetBackground(0.12, 0.12, 0.14);
-    m_vtkWidget->renderWindow()->Render();
+    const QString path = urls.first().toLocalFile();
+    if (path.endsWith(".ply", Qt::CaseInsensitive)) {
+        LoadPLYAsync(path);
+        e->acceptProposedAction();
+    }
 }
 
-void MainWindow::onOpenPly()
+void MainWindow::CreateDockUI()
 {
-    const QString path = QFileDialog::getOpenFileName(
-        this,
-        tr("Open PLY"),
-        QString(),
-        tr("PLY Files (*.ply)")
-    );
-    if (path.isEmpty())
-        return;
+    auto* dock = new QDockWidget("Controls", this);
+    dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
 
-    auto reader = vtkSmartPointer<vtkPLYReader>::New();
-    reader->SetFileName(path.toStdString().c_str());
-    reader->Update();
+    auto* panel = new QWidget(dock);
+    auto* v = new QVBoxLayout(panel);
 
-    vtkPolyData* poly = reader->GetOutput();
-    if (!poly || poly->GetNumberOfPoints() == 0) {
-        QMessageBox::warning(this, tr("Load Failed"),
-                             tr("PLY에 포인트가 없거나 읽기 실패했습니다."));
+    v->addWidget(new QLabel("PLY File:", panel));
+
+    filePathEdit_ = new QLineEdit(panel);
+    filePathEdit_->setReadOnly(true);
+    v->addWidget(filePathEdit_);
+
+    auto* openBtn = new QPushButton("Open PLY...", panel);
+    v->addWidget(openBtn);
+    connect(openBtn, &QPushButton::clicked, this, [this]() {
+        const QString path = QFileDialog::getOpenFileName(this, "Open PLY", QString(), "PLY files (*.ply)");
+        if (!path.isEmpty())
+            LoadPLYAsync(path);
+        });
+
+    auto* resetBtn = new QPushButton("Reset Camera", panel);
+    v->addWidget(resetBtn);
+    connect(resetBtn, &QPushButton::clicked, this, [this]() {
+        renderer_->ResetCamera();
+        UpdateRender();
+        });
+
+    v->addSpacing(10);
+
+    v->addWidget(new QLabel("Display Mode:", panel));
+    modeCombo_ = new QComboBox(panel);
+    modeCombo_->addItem("Surface (Default)");
+    modeCombo_->addItem("Wireframe");
+    modeCombo_->addItem("Points");
+    modeCombo_->setCurrentIndex(2);
+    v->addWidget(modeCombo_);
+    connect(modeCombo_, &QComboBox::currentIndexChanged, this, [this](int) {
+        ApplyRenderOptions();
+        });
+
+    v->addWidget(new QLabel("Point Size:", panel));
+    pointSizeSlider_ = new QSlider(Qt::Horizontal, panel);
+    pointSizeSlider_->setRange(1, 15);
+    pointSizeSlider_->setValue(3);
+    v->addWidget(pointSizeSlider_);
+    connect(pointSizeSlider_, &QSlider::valueChanged, this, [this](int) {
+        ApplyRenderOptions();
+        });
+
+    v->addWidget(new QLabel("Line Width:", panel));
+    lineWidthSlider_ = new QSlider(Qt::Horizontal, panel);
+    lineWidthSlider_->setRange(1, 10);
+    lineWidthSlider_->setValue(1);
+    v->addWidget(lineWidthSlider_);
+    connect(lineWidthSlider_, &QSlider::valueChanged, this, [this](int) {
+        ApplyRenderOptions();
+        });
+
+    v->addWidget(new QLabel("Note: Triangulate/Normals are disabled for point clouds (to avoid freeze).", panel));
+    v->addStretch(1);
+
+    panel->setLayout(v);
+    dock->setWidget(panel);
+    addDockWidget(Qt::LeftDockWidgetArea, dock);
+}
+
+void MainWindow::LoadPLYAsync(const QString& path)
+{
+    currentPath_ = path;
+    filePathEdit_->setText(path);
+
+    if (loading_) {
+        QMessageBox::information(this, "Loading", "Already loading. Please wait or cancel.");
         return;
     }
+    loading_ = true;
 
-    auto glyph = vtkSmartPointer<vtkVertexGlyphFilter>::New();
-    glyph->SetInputData(poly);
-    glyph->Update();
+    QPointer<QProgressDialog> dlg = new QProgressDialog("Loading PLY...", "Cancel", 0, 100, this);
+    dlg->setWindowModality(Qt::ApplicationModal);
+    dlg->setMinimumDuration(0);
+    dlg->setValue(0);
+    dlg->show();
 
-    auto mapper = vtkSmartPointer<vtkPolyDataMapper>::New();
-    mapper->SetInputConnection(glyph->GetOutputPort());
+    auto cancelFlag = new QAtomicInt(0);
 
-    auto actor = vtkSmartPointer<vtkActor>::New();
-    actor->SetMapper(mapper);
-    actor->GetProperty()->SetPointSize(2.0);
+    QThread* th = new QThread(this);
+    PlyLoadWorker* worker = new PlyLoadWorker();
+    worker->path = path;
+    worker->cancelFlag = cancelFlag;
+    worker->moveToThread(th);
 
-    m_rendererRaw->RemoveAllViewProps();
-    m_rendererRaw->AddActor(actor);
-    m_rendererRaw->ResetCamera();
+    connect(dlg, &QProgressDialog::canceled, this, [=]() {
+        cancelFlag->storeRelease(1);
+        dlg->setLabelText("Canceling...");
+        th->requestInterruption();
+        });
 
-    statusBar()->showMessage(tr("Loaded: %1 points").arg(poly->GetNumberOfPoints()));
-    m_vtkWidget->renderWindow()->Render();
+    connect(worker, &PlyLoadWorker::progress, this, [=](int p) {
+        if (dlg) dlg->setValue(p);
+        }, Qt::QueuedConnection);
+
+    connect(worker, &PlyLoadWorker::finished, this, [=](vtkPolyData* raw) {
+        if (dlg) { dlg->setValue(100); dlg->close(); dlg->deleteLater(); }
+
+        vtkSmartPointer<vtkPolyData> poly;
+        poly.TakeReference(raw);
+
+        mapper_->SetInputData(poly);
+        mapper_->ScalarVisibilityOff();
+
+        renderer_->ResetCamera();
+        ApplyRenderOptions();
+        UpdateRender();
+
+        loading_ = false;
+        worker->deleteLater();
+        th->quit();
+        th->deleteLater();
+        delete cancelFlag;
+        }, Qt::QueuedConnection);
+
+    connect(worker, &PlyLoadWorker::failed, this, [=](const QString& msg) {
+        if (dlg) { dlg->close(); dlg->deleteLater(); }
+        loading_ = false;
+
+        if (!msg.contains("Canceled", Qt::CaseInsensitive)) {
+            QMessageBox::critical(this, "PLY Load Failed", msg);
+        }
+
+        worker->deleteLater();
+        th->quit();
+        th->deleteLater();
+        delete cancelFlag;
+        }, Qt::QueuedConnection);
+
+    connect(th, &QThread::started, worker, &PlyLoadWorker::run);
+    th->start();
+}
+
+void MainWindow::ApplyRenderOptions()
+{
+    const int mode = modeCombo_->currentIndex();
+    auto* prop = actor_->GetProperty();
+
+    prop->SetPointSize(pointSizeSlider_->value());
+    prop->SetLineWidth(lineWidthSlider_->value());
+
+    if (mode == 0) prop->SetRepresentationToSurface();
+    else if (mode == 1) prop->SetRepresentationToWireframe();
+    else prop->SetRepresentationToPoints();
+
+    UpdateRender();
+}
+
+void MainWindow::UpdateRender()
+{
+    if (vtkWidget_ && vtkWidget_->renderWindow())
+        vtkWidget_->renderWindow()->Render();
 }
