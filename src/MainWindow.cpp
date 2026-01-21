@@ -43,6 +43,10 @@
 #include <vtkCellArray.h>
 #include <vtkIdTypeArray.h>
 
+#include <QStackedWidget>
+#include <QGroupBox>
+#include <QFormLayout>
+
 namespace {
 
     // -------------------- Safe PLY Loader (PCL binary_little_endian) --------------------
@@ -373,6 +377,71 @@ void MainWindow::CreateDockUI()
     v->addWidget(new QLabel("Note: Triangulate/Normals are disabled for point clouds (to avoid freeze).", panel));
     v->addStretch(1);
 
+    // -------------------- Workspace selector --------------------
+    v->addWidget(new QLabel("Workspace:", panel));
+
+    workspaceCombo_ = new QComboBox(panel);
+    workspaceCombo_->addItem("Scan QA");
+    workspaceCombo_->addItem("Inspection");
+    workspaceCombo_->addItem("Robot Pose");
+    workspaceCombo_->setCurrentIndex(0);
+    v->addWidget(workspaceCombo_);
+
+    // workspace-specific panels container
+    workspaceStack_ = new QStackedWidget(panel);
+    v->addWidget(workspaceStack_);
+
+    connect(workspaceCombo_, &QComboBox::currentIndexChanged, this, [this](int idx) {
+        SetWorkspaceIndex(idx);
+        });
+
+    // -------------------- Page 0: Scan QA --------------------
+    {
+        auto* page = new QWidget(panel);
+        auto* pv = new QVBoxLayout(page);
+
+        auto* box = new QGroupBox("Scan QA Metrics", page);
+        auto* form = new QFormLayout(box);
+
+        qaPointCountLabel_ = new QLabel("-", box);
+        qaBoundsLabel_ = new QLabel("-", box);
+        qaStatusLabel_ = new QLabel("Load a PLY to see metrics.", box);
+
+        form->addRow("Points:", qaPointCountLabel_);
+        form->addRow("Bounds (X/Y/Z mm):", qaBoundsLabel_);
+        form->addRow("Status:", qaStatusLabel_);
+
+        box->setLayout(form);
+        pv->addWidget(box);
+        pv->addStretch(1);
+
+        workspaceStack_->addWidget(page);
+    }
+
+    // -------------------- Page 1: Inspection (placeholder) --------------------
+    {
+        auto* page = new QWidget(panel);
+        auto* pv = new QVBoxLayout(page);
+        pv->addWidget(new QLabel("Inspection workspace: (next step) Align + Measure tools", page));
+        pv->addStretch(1);
+        workspaceStack_->addWidget(page);
+    }
+
+    // -------------------- Page 2: Robot Pose (placeholder) --------------------
+    {
+        auto* page = new QWidget(panel);
+        auto* pv = new QVBoxLayout(page);
+        pv->addWidget(new QLabel("Robot Pose workspace: (later) ROI + Normal + Pose + Export", page));
+        pv->addStretch(1);
+        workspaceStack_->addWidget(page);
+    }
+
+    // initial workspace
+    SetWorkspaceIndex(0);
+
+    // divider spacing
+    v->addSpacing(10);
+
     panel->setLayout(v);
     dock->setWidget(panel);
     addDockWidget(Qt::LeftDockWidgetArea, dock);
@@ -419,7 +488,11 @@ void MainWindow::LoadPLYAsync(const QString& path)
         vtkSmartPointer<vtkPolyData> poly;
         poly.TakeReference(raw);
 
-        mapper_->SetInputData(poly);
+        rawCloud_ = poly;
+        processedCloud_ = poly;   // 지금은 전처리 전이라 동일
+        UpdateQaMetricsUI();
+
+        mapper_->SetInputData(processedCloud_);
         mapper_->ScalarVisibilityOff();
 
         renderer_->ResetCamera();
@@ -470,4 +543,39 @@ void MainWindow::UpdateRender()
 {
     if (vtkWidget_ && vtkWidget_->renderWindow())
         vtkWidget_->renderWindow()->Render();
+}
+
+void MainWindow::SetWorkspaceIndex(int idx)
+{
+    if (workspaceStack_) workspaceStack_->setCurrentIndex(idx);
+}
+
+void MainWindow::UpdateQaMetricsUI()
+{
+    if (!qaPointCountLabel_ || !qaBoundsLabel_ || !qaStatusLabel_) return;
+
+    if (!processedCloud_ || processedCloud_->GetNumberOfPoints() <= 0) {
+        qaPointCountLabel_->setText("-");
+        qaBoundsLabel_->setText("-");
+        qaStatusLabel_->setText("No valid cloud loaded.");
+        return;
+    }
+
+    const vtkIdType n = processedCloud_->GetNumberOfPoints();
+    double b[6] = { 0,0,0,0,0,0 };
+    processedCloud_->GetBounds(b);
+
+    const double sx = b[1] - b[0];
+    const double sy = b[3] - b[2];
+    const double sz = b[5] - b[4];
+
+    qaPointCountLabel_->setText(QString::number(static_cast<long long>(n)));
+    qaBoundsLabel_->setText(QString("%1 / %2 / %3")
+        .arg(sx, 0, 'f', 2)
+        .arg(sy, 0, 'f', 2)
+        .arg(sz, 0, 'f', 2));
+
+    // 아주 단순한 1차 룰(나중에 고도화)
+    if (n < 5000) qaStatusLabel_->setText("Too few points (likely not usable).");
+    else qaStatusLabel_->setText("OK (basic). Next: add outlier/voxel/plane QA.");
 }
