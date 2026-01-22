@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QWidget>
 #include <QDockWidget>
 #include <QPushButton>
@@ -13,20 +14,15 @@
 #include <QMimeData>
 #include <QDragEnterEvent>
 #include <QDropEvent>
-
-#include <QThread>
 #include <QProgressDialog>
 #include <QPointer>
-
+#include <QThread>
+#include <QGroupBox>
+#include <QFormLayout>
 #include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QSpinBox>
-#include <QGroupBox>
-#include <QFormLayout>
-#include <QHBoxLayout>
-
-#include <vtkKdTreePointLocator.h>
-#include <vtkIdList.h>
+#include <QStackedWidget>
 
 #include <functional>
 #include <fstream>
@@ -35,6 +31,9 @@
 #include <vector>
 #include <stdexcept>
 #include <cstring>
+#include <random>
+#include <cmath>
+#include <algorithm>
 
 #include <QVTKOpenGLNativeWidget.h>
 
@@ -44,7 +43,6 @@
 #include <vtkRenderWindowInteractor.h>
 #include <vtkInteractorStyleTrackballCamera.h>
 
-#include <vtkPLYReader.h>
 #include <vtkPolyData.h>
 #include <vtkPolyDataMapper.h>
 #include <vtkActor.h>
@@ -53,13 +51,12 @@
 #include <vtkCellArray.h>
 #include <vtkIdTypeArray.h>
 
-#include <QStackedWidget>
-#include <QGroupBox>
-#include <QFormLayout>
+#include <vtkKdTreePointLocator.h>
+#include <vtkIdList.h>
 
 namespace {
 
-    // -------------------- Safe PLY Loader (PCL binary_little_endian) --------------------
+    // -------------------- Safe PLY Loader (binary_little_endian; point cloud) --------------------
     static vtkSmartPointer<vtkPolyData> LoadPlySafe_PCLBinary_Progress(
         const std::string& path,
         const std::function<void(int /*percent*/)>& onProgress,
@@ -115,7 +112,7 @@ namespace {
         }
 
         if (!headerEnded) throw std::runtime_error("PLY header end_header missing");
-        if (!isBinaryLE) throw std::runtime_error("Only binary_little_endian supported by this safe loader");
+        if (!isBinaryLE) throw std::runtime_error("Only binary_little_endian supported by this loader");
         if (vertexCount <= 0) throw std::runtime_error("Invalid vertex count");
         if (vertexProps.empty()) throw std::runtime_error("No vertex properties in header");
 
@@ -238,6 +235,211 @@ namespace {
         return poly;
     }
 
+    // -------------------- Make point-cloud poly from vtkPoints --------------------
+    static vtkSmartPointer<vtkPolyData> MakePointCloudPoly(vtkPoints* pts)
+    {
+        vtkSmartPointer<vtkPolyData> out = vtkSmartPointer<vtkPolyData>::New();
+        out->SetPoints(pts);
+
+        const vtkIdType n = pts ? pts->GetNumberOfPoints() : 0;
+
+        vtkNew<vtkIdTypeArray> conn;
+        conn->SetNumberOfComponents(1);
+        conn->SetNumberOfTuples(n * 2);
+
+        auto* ptr = conn->WritePointer(0, n * 2);
+        for (vtkIdType i = 0; i < n; ++i) {
+            ptr[2 * i] = 1;
+            ptr[2 * i + 1] = i;
+        }
+
+        vtkNew<vtkCellArray> verts;
+        verts->SetData(1, conn);
+        out->SetVerts(verts);
+
+        return out;
+    }
+
+    // -------------------- VOXEL downsample (hash grid; each voxel keeps 1 point) --------------------
+    static vtkSmartPointer<vtkPolyData> VoxelDownsample(vtkPolyData* in, double voxelMm)
+    {
+        if (!in || !in->GetPoints() || voxelMm <= 0.0) return in;
+
+        const double inv = 1.0 / voxelMm;
+
+        struct Key { int x, y, z; };
+        struct KeyHash {
+            size_t operator()(const Key& k) const noexcept {
+                size_t h = 1469598103934665603ull;
+                auto mix = [&](int v) {
+                    h ^= (size_t)v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+                    };
+                mix(k.x); mix(k.y); mix(k.z);
+                return h;
+            }
+        };
+        struct KeyEq {
+            bool operator()(const Key& a, const Key& b) const noexcept {
+                return a.x == b.x && a.y == b.y && a.z == b.z;
+            }
+        };
+
+        std::unordered_map<Key, char, KeyHash, KeyEq> seen;
+        seen.reserve((size_t)in->GetNumberOfPoints() / 4 + 1);
+
+        vtkNew<vtkPoints> pts;
+        pts->SetDataTypeToFloat();
+
+        double p[3];
+        for (vtkIdType i = 0; i < in->GetNumberOfPoints(); ++i) {
+            in->GetPoint(i, p);
+            Key k{
+                (int)std::floor(p[0] * inv),
+                (int)std::floor(p[1] * inv),
+                (int)std::floor(p[2] * inv)
+            };
+            if (seen.find(k) != seen.end()) continue;
+            seen.emplace(k, 1);
+            pts->InsertNextPoint(p);
+        }
+
+        return MakePointCloudPoly(pts);
+    }
+
+    // -------------------- OUTLIER (Radius neighbor count using KDTree) --------------------
+    static vtkSmartPointer<vtkPolyData> RadiusOutlierRemoval(vtkPolyData* in, double radiusMm, int minNeighbors)
+    {
+        if (!in || !in->GetPoints() || radiusMm <= 0.0 || minNeighbors <= 0) return in;
+
+        vtkNew<vtkKdTreePointLocator> kdtree;
+        kdtree->SetDataSet(in);
+        kdtree->BuildLocator();
+
+        vtkNew<vtkIdList> ids;
+        vtkNew<vtkPoints> pts;
+        pts->SetDataTypeToFloat();
+
+        double p[3];
+        for (vtkIdType i = 0; i < in->GetNumberOfPoints(); ++i) {
+            in->GetPoint(i, p);
+
+            ids->Reset();
+            kdtree->FindPointsWithinRadius(radiusMm, p, ids);
+
+            // self 포함 기준(현업 UI에서 직관적)
+            if ((int)ids->GetNumberOfIds() >= minNeighbors) {
+                pts->InsertNextPoint(p);
+            }
+        }
+
+        return MakePointCloudPoly(pts);
+    }
+
+    // -------------------- PLANE RANSAC (manual) --------------------
+    static void PlaneRansac(vtkPolyData* in,
+        double thresholdMm,
+        int iterations,
+        std::vector<vtkIdType>& bestInliers,
+        double& outNx, double& outNy, double& outNz, double& outD)
+    {
+        bestInliers.clear();
+        outNx = 0; outNy = 0; outNz = 1; outD = 0;
+
+        if (!in || !in->GetPoints()) return;
+        const vtkIdType N = in->GetNumberOfPoints();
+        if (N < 3) return;
+
+        std::mt19937 rng((unsigned)std::random_device{}());
+        std::uniform_int_distribution<vtkIdType> dist(0, N - 1);
+
+        double p1[3], p2[3], p3[3];
+
+        auto norm3 = [](double x, double y, double z) {
+            return std::sqrt(x * x + y * y + z * z);
+            };
+
+        const double thr = std::max(0.0001, thresholdMm);
+
+        for (int it = 0; it < iterations; ++it) {
+            vtkIdType i1 = dist(rng), i2 = dist(rng), i3 = dist(rng);
+            if (i1 == i2 || i2 == i3 || i1 == i3) continue;
+
+            in->GetPoint(i1, p1);
+            in->GetPoint(i2, p2);
+            in->GetPoint(i3, p3);
+
+            const double v1x = p2[0] - p1[0], v1y = p2[1] - p1[1], v1z = p2[2] - p1[2];
+            const double v2x = p3[0] - p1[0], v2y = p3[1] - p1[1], v2z = p3[2] - p1[2];
+
+            // n = v1 x v2
+            double nx = v1y * v2z - v1z * v2y;
+            double ny = v1z * v2x - v1x * v2z;
+            double nz = v1x * v2y - v1y * v2x;
+
+            const double nlen = norm3(nx, ny, nz);
+            if (nlen < 1e-9) continue;
+
+            nx /= nlen; ny /= nlen; nz /= nlen;
+            const double d = -(nx * p1[0] + ny * p1[1] + nz * p1[2]);
+
+            std::vector<vtkIdType> inliers;
+            inliers.reserve((size_t)N / 2);
+
+            double p[3];
+            for (vtkIdType i = 0; i < N; ++i) {
+                in->GetPoint(i, p);
+                const double distp = std::abs(nx * p[0] + ny * p[1] + nz * p[2] + d); // ||n||=1
+                if (distp <= thr) inliers.push_back(i);
+            }
+
+            if (inliers.size() > bestInliers.size()) {
+                bestInliers.swap(inliers);
+                outNx = nx; outNy = ny; outNz = nz; outD = d;
+
+                // early stop (plane dominates)
+                if (bestInliers.size() > (size_t)(N * 0.85))
+                    break;
+            }
+        }
+    }
+
+    static double PlaneRmse(vtkPolyData* in,
+        const std::vector<vtkIdType>& inliers,
+        double nx, double ny, double nz, double d)
+    {
+        if (!in || inliers.empty()) return 0.0;
+
+        double p[3];
+        double sum2 = 0.0;
+        for (auto id : inliers) {
+            in->GetPoint(id, p);
+            const double distp = (nx * p[0] + ny * p[1] + nz * p[2] + d); // signed
+            sum2 += distp * distp;
+        }
+        return std::sqrt(sum2 / (double)inliers.size());
+    }
+
+    static vtkSmartPointer<vtkPolyData> RemoveInliers(vtkPolyData* in, const std::vector<vtkIdType>& inliers)
+    {
+        if (!in || !in->GetPoints() || inliers.empty()) return in;
+
+        const vtkIdType N = in->GetNumberOfPoints();
+        std::vector<char> mask((size_t)N, 0);
+        for (auto id : inliers) if (id >= 0 && id < N) mask[(size_t)id] = 1;
+
+        vtkNew<vtkPoints> pts;
+        pts->SetDataTypeToFloat();
+
+        double p[3];
+        for (vtkIdType i = 0; i < N; ++i) {
+            if (mask[(size_t)i]) continue;
+            in->GetPoint(i, p);
+            pts->InsertNextPoint(p);
+        }
+
+        return MakePointCloudPoly(pts);
+    }
+
 } // namespace
 
 // -------------------- PlyLoadWorker --------------------
@@ -254,7 +456,7 @@ void PlyLoadWorker::run()
             throw std::runtime_error("No points found");
 
         vtkPolyData* raw = poly.GetPointer();
-        raw->Register(nullptr);      // refcount 1 보장해서 넘김
+        raw->Register(nullptr); // refcount 1 보장해서 넘김
         poly = nullptr;
 
         emit finished(raw);
@@ -267,124 +469,7 @@ void PlyLoadWorker::run()
     }
 }
 
-namespace {
-
-    // 간단 voxel downsample (격자 버킷팅: 각 voxel당 첫 점만 유지)
-    static vtkSmartPointer<vtkPolyData> VoxelDownsample(vtkPolyData* in, double voxelMm)
-    {
-        if (!in || !in->GetPoints() || voxelMm <= 0.0) return in;
-
-        const double inv = 1.0 / voxelMm;
-
-        struct Key {
-            int x, y, z;
-            bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; }
-        };
-        struct KeyHash {
-            size_t operator()(const Key& k) const noexcept {
-                // 3D int hash
-                size_t h = 1469598103934665603ull;
-                auto mix = [&](int v) {
-                    h ^= (size_t)v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-                    };
-                mix(k.x); mix(k.y); mix(k.z);
-                return h;
-            }
-        };
-
-        std::unordered_map<Key, vtkIdType, KeyHash> seen;
-        seen.reserve((size_t)in->GetNumberOfPoints() / 4 + 1);
-
-        vtkNew<vtkPoints> pts;
-        pts->SetDataTypeToFloat();
-
-        // verts cell array (point cloud)
-        vtkNew<vtkIdTypeArray> conn;
-        conn->SetNumberOfComponents(1);
-
-        vtkIdType outCount = 0;
-        double p[3];
-
-        for (vtkIdType i = 0; i < in->GetNumberOfPoints(); ++i) {
-            in->GetPoint(i, p);
-            Key k{
-                (int)std::floor(p[0] * inv),
-                (int)std::floor(p[1] * inv),
-                (int)std::floor(p[2] * inv)
-            };
-            if (seen.find(k) != seen.end()) continue;
-            seen.emplace(k, i);
-
-            pts->InsertNextPoint(p);
-            outCount++;
-        }
-
-        conn->SetNumberOfTuples(outCount * 2);
-        auto* ptr = conn->WritePointer(0, outCount * 2);
-        for (vtkIdType i = 0; i < outCount; ++i) {
-            ptr[2 * i] = 1;
-            ptr[2 * i + 1] = i;
-        }
-        vtkNew<vtkCellArray> verts;
-        verts->SetData(1, conn);
-
-        auto out = vtkSmartPointer<vtkPolyData>::New();
-        out->SetPoints(pts);
-        out->SetVerts(verts);
-        return out;
-    }
-
-    // Radius outlier removal (KDTree로 반경 내 이웃 수가 minNeighbors 미만이면 제거)
-    static vtkSmartPointer<vtkPolyData> RadiusOutlierRemoval(vtkPolyData* in, double radiusMm, int minNeighbors)
-    {
-        if (!in || !in->GetPoints() || radiusMm <= 0.0) return in;
-        if (minNeighbors <= 0) return in;
-
-        vtkNew<vtkKdTreePointLocator> kdtree;
-        kdtree->SetDataSet(in);
-        kdtree->BuildLocator();
-
-        vtkNew<vtkPoints> pts;
-        pts->SetDataTypeToFloat();
-
-        vtkNew<vtkIdList> ids;
-
-        double p[3];
-        for (vtkIdType i = 0; i < in->GetNumberOfPoints(); ++i) {
-            in->GetPoint(i, p);
-
-            ids->Reset();
-            kdtree->FindPointsWithinRadius(radiusMm, p, ids);
-
-            // ids에는 자기 자신 포함될 수 있음. minNeighbors는 "자기 포함" 기준으로 잡는게 UI에서 직관적.
-            if (ids->GetNumberOfIds() >= minNeighbors) {
-                pts->InsertNextPoint(p);
-            }
-        }
-
-        const vtkIdType outCount = pts->GetNumberOfPoints();
-
-        vtkNew<vtkIdTypeArray> conn;
-        conn->SetNumberOfComponents(1);
-        conn->SetNumberOfTuples(outCount * 2);
-
-        auto* ptr = conn->WritePointer(0, outCount * 2);
-        for (vtkIdType i = 0; i < outCount; ++i) {
-            ptr[2 * i] = 1;
-            ptr[2 * i + 1] = i;
-        }
-
-        vtkNew<vtkCellArray> verts;
-        verts->SetData(1, conn);
-
-        auto out = vtkSmartPointer<vtkPolyData>::New();
-        out->SetPoints(pts);
-        out->SetVerts(verts);
-        return out;
-    }
-
-} // namespace
-
+// -------------------- ScanQaWorker --------------------
 void ScanQaWorker::run()
 {
     try {
@@ -399,21 +484,47 @@ void ScanQaWorker::run()
         if (voxelEnabled) {
             cur = VoxelDownsample(cur, voxelMm);
         }
-        emit progress(55);
+        emit progress(35);
 
         // 2) outlier
-        vtkIdType before = cur->GetNumberOfPoints();
-        if (outlierEnabled) {
-            cur = RadiusOutlierRemoval(cur, outlierRadiusMm, outlierMinNeighbors);
+        int removedOutlier = 0;
+        {
+            const vtkIdType before = cur->GetNumberOfPoints();
+            if (outlierEnabled) {
+                cur = RadiusOutlierRemoval(cur, outlierRadiusMm, outlierMinNeighbors);
+            }
+            const vtkIdType after = cur->GetNumberOfPoints();
+            removedOutlier = (int)std::max<vtkIdType>(0, before - after);
         }
-        vtkIdType after = cur->GetNumberOfPoints();
-        int removed = (int)std::max<vtkIdType>(0, before - after);
+        emit progress(65);
+
+        // 3) plane
+        int removedPlane = 0;
+        double planeInlierRatio = 0.0;
+        double planeRmseMm = 0.0;
+
+        if (planeEnabled && cur && cur->GetNumberOfPoints() >= 3) {
+            std::vector<vtkIdType> inliers;
+            double nx, ny, nz, d;
+            PlaneRansac(cur, planeThresholdMm, planeIterations, inliers, nx, ny, nz, d);
+
+            const vtkIdType N = cur->GetNumberOfPoints();
+            planeInlierRatio = (N > 0) ? ((double)inliers.size() / (double)N) : 0.0;
+            planeRmseMm = PlaneRmse(cur, inliers, nx, ny, nz, d);
+
+            if (planeRemoveEnabled && !inliers.empty()) {
+                const vtkIdType before = cur->GetNumberOfPoints();
+                cur = RemoveInliers(cur, inliers);
+                const vtkIdType after = cur->GetNumberOfPoints();
+                removedPlane = (int)std::max<vtkIdType>(0, before - after);
+            }
+        }
 
         emit progress(95);
 
         vtkPolyData* raw = cur.GetPointer();
-        raw->Register(nullptr); // refcount 확보
-        emit finished(raw, removed);
+        raw->Register(nullptr);
+        emit finished(raw, removedOutlier, removedPlane, planeInlierRatio, planeRmseMm);
 
         emit progress(100);
     }
@@ -513,85 +624,165 @@ void MainWindow::CreateDockUI()
 
     v->addSpacing(10);
 
-    // -------------------- Scan QA Panel --------------------
+    // -------------------- Workspace selector --------------------
+    v->addWidget(new QLabel("Workspace:", panel));
+
+    workspaceCombo_ = new QComboBox(panel);
+    workspaceCombo_->addItem("Scan QA");
+    workspaceCombo_->addItem("Inspection");
+    workspaceCombo_->addItem("Robot Pose");
+    workspaceCombo_->setCurrentIndex(0);
+    v->addWidget(workspaceCombo_);
+
+    workspaceStack_ = new QStackedWidget(panel);
+    v->addWidget(workspaceStack_);
+
+    connect(workspaceCombo_, &QComboBox::currentIndexChanged, this, [this](int idx) {
+        SetWorkspaceIndex(idx);
+        });
+
+    // -------------------- Page 0: Scan QA --------------------
     {
-        auto* qaGroup = new QGroupBox("Scan QA (Preprocess)", panel);
+        auto* page = new QWidget(panel);
+        auto* pv = new QVBoxLayout(page);
+
+        // ---- Scan QA Panel (Preprocess) ----
+        auto* qaGroup = new QGroupBox("Scan QA (Preprocess)", page);
         auto* form = new QFormLayout(qaGroup);
 
         // View: Raw / Processed
-        viewCombo_ = new QComboBox(panel);
+        viewCombo_ = new QComboBox(page);
         viewCombo_->addItem("Raw");
         viewCombo_->addItem("Processed");
         viewCombo_->setCurrentIndex(0);
         form->addRow("View:", viewCombo_);
-
         connect(viewCombo_, &QComboBox::currentIndexChanged, this, [this](int idx) {
             SetViewRaw(idx == 0);
             });
 
         // Voxel
-        voxelEnable_ = new QCheckBox("Enable", panel);
+        voxelEnable_ = new QCheckBox("Enable", page);
         voxelEnable_->setChecked(true);
 
-        voxelMmSpin_ = new QDoubleSpinBox(panel);
+        voxelMmSpin_ = new QDoubleSpinBox(page);
         voxelMmSpin_->setRange(0.1, 50.0);
         voxelMmSpin_->setValue(1.0);
         voxelMmSpin_->setSingleStep(0.1);
         voxelMmSpin_->setSuffix(" mm");
 
-        auto* voxelRow = new QWidget(panel);
+        auto* voxelRow = new QWidget(page);
         auto* voxelH = new QHBoxLayout(voxelRow);
         voxelH->setContentsMargins(0, 0, 0, 0);
         voxelH->addWidget(voxelEnable_);
         voxelH->addWidget(voxelMmSpin_, 1);
         form->addRow("Voxel:", voxelRow);
 
-        // Outlier (Radius)
-        outlierEnable_ = new QCheckBox("Enable", panel);
+        // Outlier
+        outlierEnable_ = new QCheckBox("Enable", page);
         outlierEnable_->setChecked(true);
 
-        outlierRadiusSpin_ = new QDoubleSpinBox(panel);
+        outlierRadiusSpin_ = new QDoubleSpinBox(page);
         outlierRadiusSpin_->setRange(0.1, 200.0);
         outlierRadiusSpin_->setValue(3.0);
         outlierRadiusSpin_->setSingleStep(0.1);
         outlierRadiusSpin_->setSuffix(" mm");
 
-        outlierMinNbSpin_ = new QSpinBox(panel);
+        outlierMinNbSpin_ = new QSpinBox(page);
         outlierMinNbSpin_->setRange(1, 200);
         outlierMinNbSpin_->setValue(5);
 
-        auto* outRow = new QWidget(panel);
+        auto* outRow = new QWidget(page);
         auto* outH = new QHBoxLayout(outRow);
         outH->setContentsMargins(0, 0, 0, 0);
         outH->addWidget(outlierEnable_);
-        outH->addWidget(new QLabel("Radius:", panel));
+        outH->addWidget(new QLabel("R:", page));
         outH->addWidget(outlierRadiusSpin_, 1);
-        outH->addWidget(new QLabel("MinN:", panel));
+        outH->addWidget(new QLabel("MinN:", page));
         outH->addWidget(outlierMinNbSpin_);
         form->addRow("Outlier:", outRow);
 
-        applyQaBtn_ = new QPushButton("Apply Scan QA", panel);
-        form->addRow(applyQaBtn_);
+        // Plane
+        planeEnable_ = new QCheckBox("Enable", page);
+        planeEnable_->setChecked(true);
 
+        planeThresholdSpin_ = new QDoubleSpinBox(page);
+        planeThresholdSpin_->setRange(0.1, 50.0);
+        planeThresholdSpin_->setValue(2.0);
+        planeThresholdSpin_->setSingleStep(0.1);
+        planeThresholdSpin_->setSuffix(" mm");
+
+        planeIterSpin_ = new QSpinBox(page);
+        planeIterSpin_->setRange(50, 5000);
+        planeIterSpin_->setValue(200);
+
+        planeRemoveEnable_ = new QCheckBox("Remove plane", page);
+        planeRemoveEnable_->setChecked(true);
+
+        auto* planeRow = new QWidget(page);
+        auto* planeH = new QHBoxLayout(planeRow);
+        planeH->setContentsMargins(0, 0, 0, 0);
+        planeH->addWidget(planeEnable_);
+        planeH->addWidget(new QLabel("Thr:", page));
+        planeH->addWidget(planeThresholdSpin_, 1);
+        planeH->addWidget(new QLabel("Iter:", page));
+        planeH->addWidget(planeIterSpin_);
+        planeH->addWidget(planeRemoveEnable_);
+        form->addRow("Plane:", planeRow);
+
+        // Apply
+        applyQaBtn_ = new QPushButton("Apply Scan QA", page);
+        form->addRow(applyQaBtn_);
         connect(applyQaBtn_, &QPushButton::clicked, this, [this]() {
             ApplyScanQaAsync();
             });
 
         // Metrics
-        qaPointCountLabel_ = new QLabel("-", panel);
-        qaBoundsLabel_ = new QLabel("-", panel);
-        qaRemovedLabel_ = new QLabel("-", panel);
+        qaPointCountLabel_ = new QLabel("-", page);
+        qaBoundsLabel_ = new QLabel("-", page);
+        qaStatusLabel_ = new QLabel("Load a PLY to see metrics.", page);
+
+        qaRemovedOutlierLabel_ = new QLabel("-", page);
+        qaRemovedPlaneLabel_ = new QLabel("-", page);
+        qaPlaneInlierLabel_ = new QLabel("-", page);
+        qaPlaneRmseLabel_ = new QLabel("-", page);
 
         form->addRow("Points:", qaPointCountLabel_);
         form->addRow("Bounds (X/Y/Z):", qaBoundsLabel_);
-        form->addRow("Removed (last):", qaRemovedLabel_);
+        form->addRow("Status:", qaStatusLabel_);
+        form->addRow("Removed Outlier:", qaRemovedOutlierLabel_);
+        form->addRow("Removed Plane:", qaRemovedPlaneLabel_);
+        form->addRow("Plane Inlier(%):", qaPlaneInlierLabel_);
+        form->addRow("Plane RMSE(mm):", qaPlaneRmseLabel_);
 
         qaGroup->setLayout(form);
-        v->addWidget(qaGroup);
+        pv->addWidget(qaGroup);
+        pv->addStretch(1);
+
+        workspaceStack_->addWidget(page);
     }
 
-    v->addSpacing(10);
+    // -------------------- Page 1: Inspection (placeholder) --------------------
+    {
+        auto* page = new QWidget(panel);
+        auto* pv = new QVBoxLayout(page);
+        pv->addWidget(new QLabel("Inspection workspace: (next step) Align + Measure tools", page));
+        pv->addStretch(1);
+        workspaceStack_->addWidget(page);
+    }
 
+    // -------------------- Page 2: Robot Pose (placeholder) --------------------
+    {
+        auto* page = new QWidget(panel);
+        auto* pv = new QVBoxLayout(page);
+        pv->addWidget(new QLabel("Robot Pose workspace: (later) ROI + Normal + Pose + Export", page));
+        pv->addStretch(1);
+        workspaceStack_->addWidget(page);
+    }
+
+    SetWorkspaceIndex(0);
+
+    // -------------------- Render controls (common) --------------------
+    v->addSpacing(10);
 
     v->addWidget(new QLabel("Display Mode:", panel));
     modeCombo_ = new QComboBox(panel);
@@ -622,77 +813,18 @@ void MainWindow::CreateDockUI()
         ApplyRenderOptions();
         });
 
-    v->addWidget(new QLabel("Note: Triangulate/Normals are disabled for point clouds (to avoid freeze).", panel));
+    v->addWidget(new QLabel("Note: current loader supports binary_little_endian PLY only.", panel));
+
     v->addStretch(1);
-
-    // -------------------- Workspace selector --------------------
-    v->addWidget(new QLabel("Workspace:", panel));
-
-    workspaceCombo_ = new QComboBox(panel);
-    workspaceCombo_->addItem("Scan QA");
-    workspaceCombo_->addItem("Inspection");
-    workspaceCombo_->addItem("Robot Pose");
-    workspaceCombo_->setCurrentIndex(0);
-    v->addWidget(workspaceCombo_);
-
-    // workspace-specific panels container
-    workspaceStack_ = new QStackedWidget(panel);
-    v->addWidget(workspaceStack_);
-
-    connect(workspaceCombo_, &QComboBox::currentIndexChanged, this, [this](int idx) {
-        SetWorkspaceIndex(idx);
-        });
-
-    // -------------------- Page 0: Scan QA --------------------
-    {
-        auto* page = new QWidget(panel);
-        auto* pv = new QVBoxLayout(page);
-
-        auto* box = new QGroupBox("Scan QA Metrics", page);
-        auto* form = new QFormLayout(box);
-
-        qaPointCountLabel_ = new QLabel("-", box);
-        qaBoundsLabel_ = new QLabel("-", box);
-        qaStatusLabel_ = new QLabel("Load a PLY to see metrics.", box);
-
-        form->addRow("Points:", qaPointCountLabel_);
-        form->addRow("Bounds (X/Y/Z mm):", qaBoundsLabel_);
-        form->addRow("Status:", qaStatusLabel_);
-
-        box->setLayout(form);
-        pv->addWidget(box);
-        pv->addStretch(1);
-
-        workspaceStack_->addWidget(page);
-    }
-
-    // -------------------- Page 1: Inspection (placeholder) --------------------
-    {
-        auto* page = new QWidget(panel);
-        auto* pv = new QVBoxLayout(page);
-        pv->addWidget(new QLabel("Inspection workspace: (next step) Align + Measure tools", page));
-        pv->addStretch(1);
-        workspaceStack_->addWidget(page);
-    }
-
-    // -------------------- Page 2: Robot Pose (placeholder) --------------------
-    {
-        auto* page = new QWidget(panel);
-        auto* pv = new QVBoxLayout(page);
-        pv->addWidget(new QLabel("Robot Pose workspace: (later) ROI + Normal + Pose + Export", page));
-        pv->addStretch(1);
-        workspaceStack_->addWidget(page);
-    }
-
-    // initial workspace
-    SetWorkspaceIndex(0);
-
-    // divider spacing
-    v->addSpacing(10);
 
     panel->setLayout(v);
     dock->setWidget(panel);
     addDockWidget(Qt::LeftDockWidgetArea, dock);
+}
+
+void MainWindow::SetWorkspaceIndex(int idx)
+{
+    if (workspaceStack_) workspaceStack_->setCurrentIndex(idx);
 }
 
 void MainWindow::LoadPLYAsync(const QString& path)
@@ -737,21 +869,20 @@ void MainWindow::LoadPLYAsync(const QString& path)
         poly.TakeReference(raw);
 
         rawCloud_ = poly;
-        processedCloud_ = poly;   // 지금은 전처리 전이라 동일
-        UpdateQaMetricsUI();
-
-        rawCloud_ = poly;
         processedCloud_ = poly;
-        lastRemovedPoints_ = 0;
 
+        lastRemovedOutlier_ = 0;
+        lastRemovedPlane_ = 0;
+        lastPlaneInlierRatio_ = 0.0;
+        lastPlaneRmseMm_ = 0.0;
+
+        if (viewCombo_) viewCombo_->setCurrentIndex(0); // Raw
         mapper_->SetInputData(rawCloud_);
         mapper_->ScalarVisibilityOff();
 
-        UpdateQaMetricsUI();
-        if (viewCombo_) viewCombo_->setCurrentIndex(0); // Raw로 보기
-
         renderer_->ResetCamera();
         ApplyRenderOptions();
+        UpdateQaMetricsUI();
         UpdateRender();
 
         loading_ = false;
@@ -781,11 +912,11 @@ void MainWindow::LoadPLYAsync(const QString& path)
 
 void MainWindow::ApplyRenderOptions()
 {
-    const int mode = modeCombo_->currentIndex();
+    const int mode = modeCombo_ ? modeCombo_->currentIndex() : 2;
     auto* prop = actor_->GetProperty();
 
-    prop->SetPointSize(pointSizeSlider_->value());
-    prop->SetLineWidth(lineWidthSlider_->value());
+    if (pointSizeSlider_) prop->SetPointSize(pointSizeSlider_->value());
+    if (lineWidthSlider_) prop->SetLineWidth(lineWidthSlider_->value());
 
     if (mode == 0) prop->SetRepresentationToSurface();
     else if (mode == 1) prop->SetRepresentationToWireframe();
@@ -800,14 +931,10 @@ void MainWindow::UpdateRender()
         vtkWidget_->renderWindow()->Render();
 }
 
-void MainWindow::SetWorkspaceIndex(int idx)
-{
-    if (workspaceStack_) workspaceStack_->setCurrentIndex(idx);
-}
-
 void MainWindow::SetViewRaw(bool useRaw)
 {
     if (!mapper_) return;
+
     if (useRaw) {
         if (rawCloud_) mapper_->SetInputData(rawCloud_);
     }
@@ -833,8 +960,6 @@ void MainWindow::ApplyScanQaAsync()
     dlg->setValue(0);
     dlg->show();
 
-    auto cancelFlag = new QAtomicInt(0);
-
     QThread* th = new QThread(this);
     auto* worker = new ScanQaWorker();
     worker->input = rawCloud_;
@@ -846,11 +971,15 @@ void MainWindow::ApplyScanQaAsync()
     worker->outlierRadiusMm = outlierRadiusSpin_ ? outlierRadiusSpin_->value() : 3.0;
     worker->outlierMinNeighbors = outlierMinNbSpin_ ? outlierMinNbSpin_->value() : 5;
 
+    worker->planeEnabled = planeEnable_ && planeEnable_->isChecked();
+    worker->planeThresholdMm = planeThresholdSpin_ ? planeThresholdSpin_->value() : 2.0;
+    worker->planeIterations = planeIterSpin_ ? planeIterSpin_->value() : 200;
+    worker->planeRemoveEnabled = planeRemoveEnable_ && planeRemoveEnable_->isChecked();
+
     worker->moveToThread(th);
 
     connect(dlg, &QProgressDialog::canceled, this, [=]() {
-        cancelFlag->storeRelease(1); // (현재 worker는 cancelFlag를 사용하지 않지만, 확장 대비)
-        dlg->setLabelText("Canceling...");
+        dlg->setLabelText("Cancel requested (will finish current step)...");
         th->requestInterruption();
         });
 
@@ -858,28 +987,31 @@ void MainWindow::ApplyScanQaAsync()
         if (dlg) dlg->setValue(p);
         }, Qt::QueuedConnection);
 
-    connect(worker, &ScanQaWorker::finished, this, [=](vtkPolyData* outRaw, int removed) {
-        if (dlg) { dlg->setValue(100); dlg->close(); dlg->deleteLater(); }
+    connect(worker, &ScanQaWorker::finished, this,
+        [=](vtkPolyData* outRaw, int removedOut, int removedPlane, double inlierRatio, double rmseMm)
+        {
+            if (dlg) { dlg->setValue(100); dlg->close(); dlg->deleteLater(); }
 
-        vtkSmartPointer<vtkPolyData> out;
-        out.TakeReference(outRaw);
+            vtkSmartPointer<vtkPolyData> out;
+            out.TakeReference(outRaw);
 
-        processedCloud_ = out;
-        lastRemovedPoints_ = removed;
+            processedCloud_ = out;
+            lastRemovedOutlier_ = removedOut;
+            lastRemovedPlane_ = removedPlane;
+            lastPlaneInlierRatio_ = inlierRatio;
+            lastPlaneRmseMm_ = rmseMm;
 
-        // Processed로 보기 전환
-        if (viewCombo_) viewCombo_->setCurrentIndex(1);
-        mapper_->SetInputData(processedCloud_);
-        mapper_->ScalarVisibilityOff();
+            if (viewCombo_) viewCombo_->setCurrentIndex(1); // Processed
+            mapper_->SetInputData(processedCloud_);
+            mapper_->ScalarVisibilityOff();
 
-        UpdateQaMetricsUI();
-        UpdateRender();
+            UpdateQaMetricsUI();
+            UpdateRender();
 
-        processing_ = false;
-        worker->deleteLater();
-        th->quit();
-        th->deleteLater();
-        delete cancelFlag;
+            processing_ = false;
+            worker->deleteLater();
+            th->quit();
+            th->deleteLater();
         }, Qt::QueuedConnection);
 
     connect(worker, &ScanQaWorker::failed, this, [=](const QString& msg) {
@@ -890,7 +1022,6 @@ void MainWindow::ApplyScanQaAsync()
         worker->deleteLater();
         th->quit();
         th->deleteLater();
-        delete cancelFlag;
         }, Qt::QueuedConnection);
 
     connect(th, &QThread::started, worker, &ScanQaWorker::run);
@@ -899,19 +1030,29 @@ void MainWindow::ApplyScanQaAsync()
 
 void MainWindow::UpdateQaMetricsUI()
 {
-    if (!qaPointCountLabel_ || !qaBoundsLabel_ || !qaRemovedLabel_) return;
+    if (!qaPointCountLabel_ || !qaBoundsLabel_ || !qaStatusLabel_) return;
 
-    vtkPolyData* cloud = (viewCombo_ && viewCombo_->currentIndex() == 0) ? rawCloud_.GetPointer() : processedCloud_.GetPointer();
+    vtkPolyData* cloud = (viewCombo_ && viewCombo_->currentIndex() == 0)
+        ? rawCloud_.GetPointer()
+        : processedCloud_.GetPointer();
+
     if (!cloud || cloud->GetNumberOfPoints() <= 0) {
         qaPointCountLabel_->setText("-");
         qaBoundsLabel_->setText("-");
-        qaRemovedLabel_->setText("-");
+        qaStatusLabel_->setText("No valid cloud loaded.");
+
+        if (qaRemovedOutlierLabel_) qaRemovedOutlierLabel_->setText("-");
+        if (qaRemovedPlaneLabel_) qaRemovedPlaneLabel_->setText("-");
+        if (qaPlaneInlierLabel_) qaPlaneInlierLabel_->setText("-");
+        if (qaPlaneRmseLabel_) qaPlaneRmseLabel_->setText("-");
         return;
     }
 
     const vtkIdType n = cloud->GetNumberOfPoints();
     double b[6]; cloud->GetBounds(b);
-    const double sx = b[1] - b[0], sy = b[3] - b[2], sz = b[5] - b[4];
+    const double sx = b[1] - b[0];
+    const double sy = b[3] - b[2];
+    const double sz = b[5] - b[4];
 
     qaPointCountLabel_->setText(QString::number((long long)n));
     qaBoundsLabel_->setText(QString("%1 / %2 / %3 mm")
@@ -919,5 +1060,12 @@ void MainWindow::UpdateQaMetricsUI()
         .arg(sy, 0, 'f', 2)
         .arg(sz, 0, 'f', 2));
 
-    qaRemovedLabel_->setText(QString::number(lastRemovedPoints_));
+    // status (simple)
+    if (n < 5000) qaStatusLabel_->setText("Too few points (likely not usable).");
+    else qaStatusLabel_->setText("OK (basic).");
+
+    if (qaRemovedOutlierLabel_) qaRemovedOutlierLabel_->setText(QString::number(lastRemovedOutlier_));
+    if (qaRemovedPlaneLabel_) qaRemovedPlaneLabel_->setText(QString::number(lastRemovedPlane_));
+    if (qaPlaneInlierLabel_) qaPlaneInlierLabel_->setText(QString("%1 %").arg(lastPlaneInlierRatio_ * 100.0, 0, 'f', 1));
+    if (qaPlaneRmseLabel_) qaPlaneRmseLabel_->setText(QString::number(lastPlaneRmseMm_, 'f', 3));
 }

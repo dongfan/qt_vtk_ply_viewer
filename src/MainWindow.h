@@ -23,7 +23,7 @@ class vtkPolyDataMapper;
 class vtkActor;
 class vtkPolyData;
 
-// Worker (moc 대상: 헤더에 둬서 자동 moc 되게 함)
+// -------------------- PLY Loader Worker --------------------
 class PlyLoadWorker : public QObject
 {
     Q_OBJECT
@@ -40,24 +40,41 @@ public slots:
     void run();
 };
 
-// -------------------- ScanQA Process Worker --------------------
+// -------------------- Scan QA Worker --------------------
 class ScanQaWorker : public QObject
 {
     Q_OBJECT
 public:
     vtkSmartPointer<vtkPolyData> input;
 
-    // params
+    // Voxel
     bool voxelEnabled = true;
     double voxelMm = 1.0;
 
+    // Outlier (Radius)
     bool outlierEnabled = true;
     double outlierRadiusMm = 3.0;
     int outlierMinNeighbors = 5;
 
+    // Plane (RANSAC)
+    bool planeEnabled = true;
+    double planeThresholdMm = 2.0;
+    int planeIterations = 200;
+    bool planeRemoveEnabled = true; // plane 제거 ON/OFF
+
 signals:
     void progress(int percent);
-    void finished(vtkPolyData* outRaw, int removedPoints);
+
+    // removedOutlier: Outlier 제거된 점 개수
+    // removedPlane: Plane 제거된 점 개수(planeRemoveEnabled일 때만 의미)
+    // planeInlierRatio: 0~1 (planeEnabled일 때만 의미)
+    // planeRmseMm: mm (planeEnabled일 때만 의미)
+    void finished(vtkPolyData* outRaw,
+        int removedOutlier,
+        int removedPlane,
+        double planeInlierRatio,
+        double planeRmseMm);
+
     void failed(QString msg);
 
 public slots:
@@ -86,33 +103,20 @@ private:
 
     // Scan QA
     void ApplyScanQaAsync();
+    void SetViewRaw(bool useRaw);
     void UpdateQaMetricsUI();
 
-    void SetViewRaw(bool useRaw);
-
 private:
+    // VTK view
     QVTKOpenGLNativeWidget* vtkWidget_ = nullptr;
 
+    // Common controls
     QLineEdit* filePathEdit_ = nullptr;
     QComboBox* modeCombo_ = nullptr;
     QSlider* pointSizeSlider_ = nullptr;
     QSlider* lineWidthSlider_ = nullptr;
 
-    // Scan QA controls
-    QComboBox* viewCombo_ = nullptr;          // Raw / Processed
-    QCheckBox* voxelEnable_ = nullptr;
-    QDoubleSpinBox* voxelMmSpin_ = nullptr;
-
-    QCheckBox* outlierEnable_ = nullptr;
-    QDoubleSpinBox* outlierRadiusSpin_ = nullptr;
-    QSpinBox* outlierMinNbSpin_ = nullptr;
-
-    QPushButton* applyQaBtn_ = nullptr;
-
-    QString currentPath_;
-    bool loading_ = false;
-    bool processing_ = false;
-
+    // VTK pipeline
     vtkSmartPointer<vtkRenderer> renderer_;
     vtkSmartPointer<vtkPolyDataMapper> mapper_;
     vtkSmartPointer<vtkActor> actor_;
@@ -121,15 +125,43 @@ private:
     QComboBox* workspaceCombo_ = nullptr;
     QStackedWidget* workspaceStack_ = nullptr;
 
-    // --- Scan QA metrics UI (일단 3개만) ---
+    // --- Scan QA UI controls ---
+    QComboBox* viewCombo_ = nullptr;          // Raw / Processed
+    QCheckBox* voxelEnable_ = nullptr;
+    QDoubleSpinBox* voxelMmSpin_ = nullptr;
+
+    QCheckBox* outlierEnable_ = nullptr;
+    QDoubleSpinBox* outlierRadiusSpin_ = nullptr;
+    QSpinBox* outlierMinNbSpin_ = nullptr;
+
+    QCheckBox* planeEnable_ = nullptr;
+    QDoubleSpinBox* planeThresholdSpin_ = nullptr;
+    QSpinBox* planeIterSpin_ = nullptr;
+    QCheckBox* planeRemoveEnable_ = nullptr;
+
+    QPushButton* applyQaBtn_ = nullptr;
+
+    // --- Scan QA metrics UI ---
     QLabel* qaPointCountLabel_ = nullptr;
     QLabel* qaBoundsLabel_ = nullptr;
     QLabel* qaStatusLabel_ = nullptr;
-    QLabel* qaRemovedLabel_ = nullptr;
 
-    // --- DataModel 최소 (원본/처리본) ---
+    QLabel* qaRemovedOutlierLabel_ = nullptr;
+    QLabel* qaRemovedPlaneLabel_ = nullptr;
+    QLabel* qaPlaneInlierLabel_ = nullptr;
+    QLabel* qaPlaneRmseLabel_ = nullptr;
+
+    // --- State ---
+    QString currentPath_;
+    bool loading_ = false;
+    bool processing_ = false;
+
+    // --- DataModel ---
     vtkSmartPointer<vtkPolyData> rawCloud_;
     vtkSmartPointer<vtkPolyData> processedCloud_;
-    int lastRemovedPoints_ = 0;
 
+    int lastRemovedOutlier_ = 0;
+    int lastRemovedPlane_ = 0;
+    double lastPlaneInlierRatio_ = 0.0;
+    double lastPlaneRmseMm_ = 0.0;
 };
