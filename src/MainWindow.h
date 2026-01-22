@@ -11,14 +11,17 @@ class QVTKOpenGLNativeWidget;
 class QLineEdit;
 class QComboBox;
 class QSlider;
+class QCheckBox;
+class QDoubleSpinBox;
+class QSpinBox;
+class QPushButton;
+class QStackedWidget;
+class QLabel;
 
 class vtkRenderer;
 class vtkPolyDataMapper;
 class vtkActor;
 class vtkPolyData;
-
-class QStackedWidget;
-class QLabel;
 
 // Worker (moc 대상: 헤더에 둬서 자동 moc 되게 함)
 class PlyLoadWorker : public QObject
@@ -37,6 +40,30 @@ public slots:
     void run();
 };
 
+// -------------------- ScanQA Process Worker --------------------
+class ScanQaWorker : public QObject
+{
+    Q_OBJECT
+public:
+    vtkSmartPointer<vtkPolyData> input;
+
+    // params
+    bool voxelEnabled = true;
+    double voxelMm = 1.0;
+
+    bool outlierEnabled = true;
+    double outlierRadiusMm = 3.0;
+    int outlierMinNeighbors = 5;
+
+signals:
+    void progress(int percent);
+    void finished(vtkPolyData* outRaw, int removedPoints);
+    void failed(QString msg);
+
+public slots:
+    void run();
+};
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -49,12 +76,19 @@ protected:
 
 private:
     void CreateDockUI();
+
+    // Data / actions
     void LoadPLYAsync(const QString& path);
     void ApplyRenderOptions();
     void UpdateRender();
 
     void SetWorkspaceIndex(int idx);
+
+    // Scan QA
+    void ApplyScanQaAsync();
     void UpdateQaMetricsUI();
+
+    void SetViewRaw(bool useRaw);
 
 private:
     QVTKOpenGLNativeWidget* vtkWidget_ = nullptr;
@@ -64,8 +98,20 @@ private:
     QSlider* pointSizeSlider_ = nullptr;
     QSlider* lineWidthSlider_ = nullptr;
 
+    // Scan QA controls
+    QComboBox* viewCombo_ = nullptr;          // Raw / Processed
+    QCheckBox* voxelEnable_ = nullptr;
+    QDoubleSpinBox* voxelMmSpin_ = nullptr;
+
+    QCheckBox* outlierEnable_ = nullptr;
+    QDoubleSpinBox* outlierRadiusSpin_ = nullptr;
+    QSpinBox* outlierMinNbSpin_ = nullptr;
+
+    QPushButton* applyQaBtn_ = nullptr;
+
     QString currentPath_;
     bool loading_ = false;
+    bool processing_ = false;
 
     vtkSmartPointer<vtkRenderer> renderer_;
     vtkSmartPointer<vtkPolyDataMapper> mapper_;
@@ -79,9 +125,11 @@ private:
     QLabel* qaPointCountLabel_ = nullptr;
     QLabel* qaBoundsLabel_ = nullptr;
     QLabel* qaStatusLabel_ = nullptr;
+    QLabel* qaRemovedLabel_ = nullptr;
 
     // --- DataModel 최소 (원본/처리본) ---
     vtkSmartPointer<vtkPolyData> rawCloud_;
     vtkSmartPointer<vtkPolyData> processedCloud_;
+    int lastRemovedPoints_ = 0;
 
 };
