@@ -36,6 +36,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   VTK::InteractionStyle
   VTK::RenderingCore
   VTK::RenderingOpenGL2
+  VTK::RenderingAnnotation
   VTK::GUISupportQt
   VTK::IOPLY
 )

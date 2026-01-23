@@ -17,12 +17,25 @@
 #include <QProgressDialog>
 #include <QPointer>
 #include <QThread>
+#include <QPainter>
+#include <QFontMetrics>
+#include <QtMath>
+#include <algorithm>
+#include <numeric>
+
 #include <QGroupBox>
 #include <QFormLayout>
 #include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QEvent>
+#include <QSplitter>
+#include <QTimer>
+#include <QRegularExpression>
+#include <QTextDocument>
+#include <QToolTip>
+#include <QCursor>
 
 #include <functional>
 #include <fstream>
@@ -37,6 +50,125 @@
 
 #include <QVTKOpenGLNativeWidget.h>
 
+// ----------------- XYZ plot widget (no QtCharts dependency) -----------------
+class XyzPlotWidget : public QWidget {
+public:
+    explicit XyzPlotWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setMinimumHeight(220);
+        setMouseTracking(true);
+    }
+
+    struct AxisStats {
+        double minV = 0.0;
+        double maxV = 0.0;
+        double mean = 0.0;
+        double stdev = 0.0;
+    };
+
+    void setData(const QVector<int>& hx,
+                 const QVector<int>& hy,
+                 const QVector<int>& hz,
+                 const AxisStats& sx,
+                 const AxisStats& sy,
+                 const AxisStats& sz)
+    {
+        hx_ = hx; hy_ = hy; hz_ = hz;
+        sx_ = sx; sy_ = sy; sz_ = sz;
+        update();
+    }
+
+    void clear() {
+        hx_.clear(); hy_.clear(); hz_.clear();
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+
+        // background
+        p.fillRect(rect(), QColor(25, 25, 30));
+
+        const int pad = 10;
+        const int gap = 10;
+        QRect r = rect().adjusted(pad, pad, -pad, -pad);
+
+        const int hEach = (r.height() - 2 * gap) / 3;
+        QRect rx(r.left(), r.top(), r.width(), hEach);
+        QRect ry(r.left(), r.top() + hEach + gap, r.width(), hEach);
+        QRect rz(r.left(), r.top() + 2 * (hEach + gap), r.width(), hEach);
+
+        drawHist(p, rx, "X", hx_, sx_);
+        drawHist(p, ry, "Y", hy_, sy_);
+        drawHist(p, rz, "Z", hz_, sz_);
+    }
+
+private:
+    static double safeMaxCount(const QVector<int>& h) {
+        int mx = 0;
+        for (int v : h) mx = std::max(mx, v);
+        return mx > 0 ? double(mx) : 1.0;
+    }
+
+    void drawHist(QPainter& p, const QRect& r, const QString& name,
+                  const QVector<int>& h, const AxisStats& s)
+    {
+        // frame
+        p.setPen(QColor(90, 90, 110));
+        p.drawRoundedRect(r, 6, 6);
+
+        // title + stats
+        p.setPen(QColor(230, 230, 240));
+        const QString title = QString("%1  min:%2  max:%3  mean:%4  σ:%5")
+            .arg(name)
+            .arg(s.minV, 0, 'f', 2)
+            .arg(s.maxV, 0, 'f', 2)
+            .arg(s.mean, 0, 'f', 2)
+            .arg(s.stdev, 0, 'f', 2);
+
+        const int textH = 18;
+        p.drawText(r.adjusted(8, 2, -8, 0), Qt::AlignLeft | Qt::AlignTop, title);
+
+        QRect plot = r.adjusted(8, textH + 4, -8, -10);
+
+        if (h.isEmpty()) {
+            p.setPen(QColor(150, 150, 170));
+            p.drawText(plot, Qt::AlignCenter, "No data");
+            return;
+        }
+
+        const double mx = safeMaxCount(h);
+        const int n = h.size();
+
+        // axes baseline
+        p.setPen(QColor(120, 120, 140));
+        p.drawLine(plot.bottomLeft(), plot.bottomRight());
+
+        // bars
+        const double barW = double(plot.width()) / double(n);
+        for (int i = 0; i < n; ++i) {
+            const double frac = double(h[i]) / mx;
+            const int bh = int(frac * double(plot.height()));
+            QRectF br(plot.left() + i * barW,
+                      plot.bottom() - bh,
+                      std::max(1.0, barW - 1.0),
+                      bh);
+            p.fillRect(br, QColor(120, 200, 255, 170));
+        }
+
+        // min/max labels
+        p.setPen(QColor(200, 200, 210));
+        p.drawText(r.adjusted(8, 0, -8, -2), Qt::AlignLeft | Qt::AlignBottom,
+                   QString::number(s.minV, 'f', 2));
+        p.drawText(r.adjusted(8, 0, -8, -2), Qt::AlignRight | Qt::AlignBottom,
+                   QString::number(s.maxV, 'f', 2));
+    }
+
+    QVector<int> hx_, hy_, hz_;
+    AxisStats sx_, sy_, sz_;
+};
+
 #include <vtkGenericOpenGLRenderWindow.h>
 #include <vtkNew.h>
 #include <vtkRenderer.h>
@@ -47,6 +179,15 @@
 #include <vtkPolyDataMapper.h>
 #include <vtkActor.h>
 #include <vtkProperty.h>
+#include <vtkAxesActor.h>
+#include <vtkOrientationMarkerWidget.h>
+#include <vtkCubeAxesActor.h>
+#include <vtkTextProperty.h>
+#include <vtkLookupTable.h>
+#include <vtkScalarBarActor.h>
+#include <vtkPointData.h>
+#include <vtkFloatArray.h>
+#include <vtkElevationFilter.h>
 #include <vtkPoints.h>
 #include <vtkCellArray.h>
 #include <vtkIdTypeArray.h>
@@ -536,6 +677,13 @@ void ScanQaWorker::run()
     }
 }
 
+static QString HtmlToPlainText(const QString& html)
+{
+    QTextDocument doc;
+    doc.setHtml(html);
+    return doc.toPlainText();
+}
+
 // -------------------- MainWindow --------------------
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -545,13 +693,47 @@ MainWindow::MainWindow(QWidget* parent)
     setAcceptDrops(true);
 
     auto* central = new QWidget(this);
+
+    // ✅ Splitter로 뷰어/도움말을 위아래로 분리 (사용자 드래그로 높이 조절 가능)
+    auto* splitter = new QSplitter(Qt::Vertical, central);
+
+    // VTK Viewer (위)
+    vtkWidget_ = new QVTKOpenGLNativeWidget(splitter);
+    splitter->addWidget(vtkWidget_);
+
+    // Help panel (아래)
+    helpLabel_ = new QTextBrowser(splitter);
+    helpLabel_->setText("Tip: Hover controls to see help.");
+    helpLabel_->setReadOnly(true);
+    helpLabel_->setOpenExternalLinks(false); // 나중에 true로 가능
+    helpLabel_->setStyleSheet(
+        "padding:6px;"
+        "background:#1f2329;"
+        "color:#c9d1d9;"
+        "border-top:1px solid #333;"
+    );
+    splitter->addWidget(helpLabel_);
+
+    // Help 패널 클릭 시, QA 도움말 고정(pin) 해제용
+    helpLabel_->installEventFilter(this);
+
+    // 초기 사이즈 비율: Viewer 크게 / Help 작게
+    splitter->setStretchFactor(0, 10); // VTK
+    splitter->setStretchFactor(1, 1);  // Help
+    splitter->setSizes({ 800, 80 });     // 초기 높이(원하는 값으로 조절 가능)
+
+    // 최소 높이 (완전히 안 보이게 접히는 걸 막고 싶으면 값 올리세요)
+    vtkWidget_->setMinimumHeight(200);
+    helpLabel_->setMinimumHeight(24);
+
+    // central 레이아웃에는 splitter만 넣는다
     auto* layout = new QVBoxLayout(central);
     layout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(splitter);
 
-    vtkWidget_ = new QVTKOpenGLNativeWidget(central);
-    layout->addWidget(vtkWidget_);
     setCentralWidget(central);
 
+    // ---- VTK setup ----
     vtkNew<vtkGenericOpenGLRenderWindow> rw;
     vtkWidget_->setRenderWindow(rw);
 
@@ -571,6 +753,7 @@ MainWindow::MainWindow(QWidget* parent)
     renderer_->AddActor(actor_);
 
     CreateDockUI();
+    InstallAxesAndColor();
     ApplyRenderOptions();
     UpdateRender();
 }
@@ -736,6 +919,60 @@ void MainWindow::CreateDockUI()
             ApplyScanQaAsync();
             });
 
+        installHelp(voxelMmSpin_,
+            "<b>Voxel (mm) – Downsample Grid Size</b><br>"
+            "• Reduces point density by keeping one point per voxel.<br><br>"
+            "• <b>Smaller value</b>: more detail, slower processing<br>"
+            "• <b>Larger value</b>: fewer points, faster processing<br><br>"
+            "<i>Typical:</i> 0.3 – 2.0 mm<br>"
+            "<i>Note:</i> Too large voxels may reduce plane inlier ratio."
+        );
+
+        installHelp(outlierRadiusSpin_,
+            "<b>R (mm) – Outlier Search Radius</b><br>"
+            "• Counts neighboring points within radius <b>R</b>.<br>"
+            "• A point is kept only if neighbors ≥ <b>MinN</b>.<br><br>"
+            "• <b>Smaller R</b>: stricter, removes more sparse points<br>"
+            "• <b>Larger R</b>: keeps more points, may preserve noise<br><br>"
+            "<i>Typical:</i> 2 – 10 mm"
+        );
+
+        installHelp(outlierMinNbSpin_,
+            "<b>MinN – Minimum Neighbor Count</b><br>"
+            "• Minimum number of points required within radius <b>R</b>.<br><br>"
+            "• <b>Higher value</b>: aggressive noise removal<br>"
+            "• <b>Lower value</b>: preserves sparse regions<br><br>"
+            "<i>Typical:</i> 3 – 15<br>"
+            "<i>Tip:</i> Increase MinN if floating noise remains."
+        );
+
+        installHelp(planeThresholdSpin_,
+            "<b>Thr (mm) – Plane Inlier Distance Threshold</b><br>"
+            "• A point is considered a plane inlier if:<br>"
+            "&nbsp;&nbsp;&nbsp;&nbsp;<b>distance to plane ≤ Thr</b><br><br>"
+            "• <b>Larger Thr</b>: higher plane inlier (%)<br>"
+            "• <b>Smaller Thr</b>: stricter plane definition<br><br>"
+            "<i>Typical:</i> 1 – 8 mm<br>"
+            "<i>Note:</i> Too small values may underestimate plane coverage."
+        );
+
+        installHelp(planeIterSpin_,
+            "<b>Iter – RANSAC Iterations</b><br>"
+            "• Number of random plane hypotheses tested.<br><br>"
+            "• <b>Higher value</b>: better chance to find dominant plane<br>"
+            "• <b>Lower value</b>: faster, but may miss correct plane<br><br>"
+            "<i>Typical:</i> 200 – 2000<br>"
+            "<i>Tip:</i> Increase for complex scenes or low inlier ratios."
+        );
+
+        installHelp(planeRemoveEnable_,
+            "<b>Remove Plane</b><br>"
+            "• Removes detected plane inlier points (e.g., table or floor).<br><br>"
+            "• <b>ON</b>: isolate objects for picking / inspection<br>"
+            "• <b>OFF</b>: visualize plane quality without removal<br><br>"
+            "<i>Recommended:</i> ON for picking, OFF for QA tuning"
+        );
+
         // Metrics
         qaPointCountLabel_ = new QLabel("-", page);
         qaBoundsLabel_ = new QLabel("-", page);
@@ -745,6 +982,9 @@ void MainWindow::CreateDockUI()
         qaRemovedPlaneLabel_ = new QLabel("-", page);
         qaPlaneInlierLabel_ = new QLabel("-", page);
         qaPlaneRmseLabel_ = new QLabel("-", page);
+        // QA 기준 Help 연동(FAIL/PASS 클릭)
+        InstallQaCriteriaHelp();
+
 
         form->addRow("Points:", qaPointCountLabel_);
         form->addRow("Bounds (X/Y/Z):", qaBoundsLabel_);
@@ -813,6 +1053,42 @@ void MainWindow::CreateDockUI()
         ApplyRenderOptions();
         });
 
+    // -------------------- Coordinate & Color --------------------
+    v->addSpacing(10);
+    v->addWidget(new QLabel("Coordinate & Color:", panel));
+
+    showAxesCheck_ = new QCheckBox("Show corner axes", panel);
+    showAxesCheck_->setChecked(true);
+    v->addWidget(showAxesCheck_);
+
+    showCubeAxesCheck_ = new QCheckBox("Show bounds axes (X/Y/Z)", panel);
+    showCubeAxesCheck_->setChecked(true);
+    v->addWidget(showCubeAxesCheck_);
+
+    v->addWidget(new QLabel("Color:", panel));
+    colorModeCombo_ = new QComboBox(panel);
+    colorModeCombo_->addItem("Solid");
+    colorModeCombo_->addItem("Height (Z) Jet");
+    colorModeCombo_->addItem("PLY RGB (if available)");
+    colorModeCombo_->setCurrentIndex(0);
+    v->addWidget(colorModeCombo_);
+
+    showScalarBarCheck_ = new QCheckBox("Show color legend", panel);
+    showScalarBarCheck_->setChecked(true);
+    v->addWidget(showScalarBarCheck_);
+
+    // update hooks
+    auto refreshAxesAndColor = [this]() {
+        ApplyColorMappingForCurrentView();
+        UpdateAxesAndColor();
+        ApplyRenderOptions();
+        UpdateRender();
+    };
+    connect(showAxesCheck_, &QCheckBox::toggled, this, [refreshAxesAndColor](bool) { refreshAxesAndColor(); });
+    connect(showCubeAxesCheck_, &QCheckBox::toggled, this, [refreshAxesAndColor](bool) { refreshAxesAndColor(); });
+    connect(showScalarBarCheck_, &QCheckBox::toggled, this, [refreshAxesAndColor](bool) { refreshAxesAndColor(); });
+    connect(colorModeCombo_, &QComboBox::currentIndexChanged, this, [refreshAxesAndColor](int) { refreshAxesAndColor(); });
+
     v->addWidget(new QLabel("Note: current loader supports binary_little_endian PLY only.", panel));
 
     v->addStretch(1);
@@ -878,7 +1154,8 @@ void MainWindow::LoadPLYAsync(const QString& path)
 
         if (viewCombo_) viewCombo_->setCurrentIndex(0); // Raw
         mapper_->SetInputData(rawCloud_);
-        mapper_->ScalarVisibilityOff();
+        ApplyColorMappingForCurrentView();
+        UpdateAxesAndColor();
 
         renderer_->ResetCamera();
         ApplyRenderOptions();
@@ -925,6 +1202,172 @@ void MainWindow::ApplyRenderOptions()
     UpdateRender();
 }
 
+// -------------------- Coordinate axes + color mapping --------------------
+void MainWindow::InstallAxesAndColor()
+{
+    // Corner triad (orientation marker)
+    axesActor_ = vtkSmartPointer<vtkAxesActor>::New();
+    axesActor_->SetTotalLength(60.0, 60.0, 60.0);
+    axesActor_->SetShaftTypeToCylinder();
+    axesActor_->SetCylinderRadius(0.03);
+
+    axesWidget_ = vtkSmartPointer<vtkOrientationMarkerWidget>::New();
+    axesWidget_->SetOrientationMarker(axesActor_);
+    axesWidget_->SetViewport(0.0, 0.0, 0.18, 0.18);
+    if (vtkWidget_ && vtkWidget_->renderWindow() && vtkWidget_->renderWindow()->GetInteractor()) {
+        axesWidget_->SetInteractor(vtkWidget_->renderWindow()->GetInteractor());
+    }
+    axesWidget_->SetEnabled(1);
+    axesWidget_->InteractiveOff();
+
+    // Bounds axes with labels (CubeAxes)
+    cubeAxes_ = vtkSmartPointer<vtkCubeAxesActor>::New();
+    cubeAxes_->SetFlyModeToOuterEdges();
+    cubeAxes_->SetGridLineLocation(vtkCubeAxesActor::VTK_GRID_LINES_FURTHEST);
+    cubeAxes_->SetCamera(renderer_->GetActiveCamera());
+    cubeAxes_->SetXTitle("X (mm)");
+    cubeAxes_->SetYTitle("Y (mm)");
+    cubeAxes_->SetZTitle("Z (mm)");
+    cubeAxes_->SetXAxisVisibility(1);
+    cubeAxes_->SetYAxisVisibility(1);
+    cubeAxes_->SetZAxisVisibility(1);
+
+    // title/label colors: X red, Y green, Z blue
+    auto setAxisText = [](vtkTextProperty* tp, double r, double g, double b) {
+        if (!tp) return;
+        tp->SetColor(r, g, b);
+        tp->SetFontSize(12);
+        tp->BoldOn();
+        tp->ShadowOff();
+    };
+    //setAxisText(cubeAxes_->GetXTitleTextProperty(0), 1.0, 0.2, 0.2);
+    //setAxisText(cubeAxes_->GetXLabelTextProperty(0), 0.95, 0.75, 0.75);
+    //setAxisText(cubeAxes_->GetYTitleTextProperty(0), 0.2, 1.0, 0.2);
+    //setAxisText(cubeAxes_->GetYLabelTextProperty(0), 0.75, 0.95, 0.75);
+    //setAxisText(cubeAxes_->GetZTitleTextProperty(0), 0.2, 0.4, 1.0);
+    //setAxisText(cubeAxes_->GetZLabelTextProperty(0), 0.75, 0.82, 0.95);
+
+    renderer_->AddActor(cubeAxes_);
+
+    // Jet-like LUT for height coloring
+    lutJet_ = vtkSmartPointer<vtkLookupTable>::New();
+    lutJet_->SetNumberOfTableValues(256);
+    // HSV hue sweep blue(0.667) -> red(0.0) resembles Jet for many uses
+    lutJet_->SetHueRange(0.667, 0.0);
+    lutJet_->SetSaturationRange(1.0, 1.0);
+    lutJet_->SetValueRange(1.0, 1.0);
+    lutJet_->Build();
+
+    scalarBar_ = vtkSmartPointer<vtkScalarBarActor>::New();
+    scalarBar_->SetLookupTable(lutJet_);
+    scalarBar_->SetTitle("Z (mm)");
+    scalarBar_->SetNumberOfLabels(5);
+    scalarBar_->SetMaximumWidthInPixels(90);
+    scalarBar_->SetMaximumHeightInPixels(280);
+    renderer_->AddActor2D(scalarBar_);
+
+    elevationFilter_ = vtkSmartPointer<vtkElevationFilter>::New();
+
+    // Initial visibility
+    UpdateAxesAndColor();
+    ApplyColorMappingForCurrentView();
+}
+
+void MainWindow::UpdateAxesAndColor()
+{
+    // Toggle visibility according to UI
+    const bool showCorner = (showAxesCheck_ ? showAxesCheck_->isChecked() : true);
+    const bool showBounds = (showCubeAxesCheck_ ? showCubeAxesCheck_->isChecked() : true);
+
+    if (axesWidget_) axesWidget_->SetEnabled(showCorner ? 1 : 0);
+    if (cubeAxes_) cubeAxes_->SetVisibility(showBounds ? 1 : 0);
+
+    // Update bounds from current mapper input
+    vtkPolyData* cloud = nullptr;
+    const bool wantProcessed = (viewCombo_ && viewCombo_->currentIndex() == 1);
+    if (wantProcessed && processedCloud_ && processedCloud_->GetNumberOfPoints() > 0) cloud = processedCloud_;
+    else if (rawCloud_ && rawCloud_->GetNumberOfPoints() > 0) cloud = rawCloud_;
+    if (cloud && cubeAxes_) {
+        double b[6] = {0,0,0,0,0,0};
+        cloud->GetBounds(b);
+        cubeAxes_->SetBounds(b);
+        cubeAxes_->SetCamera(renderer_->GetActiveCamera());
+    }
+}
+
+void MainWindow::ApplyColorMappingForCurrentView()
+{
+    if (!mapper_) return;
+
+    vtkPolyData* cloud = nullptr;
+    const bool wantProcessed = (viewCombo_ && viewCombo_->currentIndex() == 1);
+    if (wantProcessed && processedCloud_ && processedCloud_->GetNumberOfPoints() > 0) cloud = processedCloud_;
+    else if (rawCloud_ && rawCloud_->GetNumberOfPoints() > 0) cloud = rawCloud_;
+    if (!cloud) {
+        mapper_->ScalarVisibilityOff();
+        if (scalarBar_) scalarBar_->SetVisibility(0);
+        return;
+    }
+
+    const int mode = (colorModeCombo_ ? colorModeCombo_->currentIndex() : 0);
+    const bool showBar = (showScalarBarCheck_ ? showScalarBarCheck_->isChecked() : true);
+
+    // 0 Solid
+    if (mode == 0) {
+        mapper_->SetInputData(cloud);
+        mapper_->ScalarVisibilityOff();
+        actor_->GetProperty()->SetColor(0.9, 0.9, 0.9);
+        if (scalarBar_) scalarBar_->SetVisibility(0);
+        return;
+    }
+
+    // 1 Height (Z) Jet
+    if (mode == 1) {
+        double b[6] = {0,0,0,0,0,0};
+        cloud->GetBounds(b);
+
+        // Elevation filter generates a scalar array based on Z
+        elevationFilter_->SetInputData(cloud);
+        elevationFilter_->SetLowPoint(0.0, 0.0, b[4]);
+        elevationFilter_->SetHighPoint(0.0, 0.0, b[5]);
+        elevationFilter_->Update();
+
+        mapper_->SetInputConnection(elevationFilter_->GetOutputPort());
+        mapper_->SetLookupTable(lutJet_);
+        mapper_->SetScalarRange(b[4], b[5]);
+        mapper_->ScalarVisibilityOn();
+        actor_->GetProperty()->SetColor(1.0, 1.0, 1.0);
+
+        if (scalarBar_) {
+            scalarBar_->SetLookupTable(lutJet_);
+            scalarBar_->SetTitle("Z (mm)");
+            scalarBar_->SetVisibility(showBar ? 1 : 0);
+        }
+        return;
+    }
+
+    // 2 PLY RGB (if available)
+    if (mode == 2) {
+        mapper_->SetInputData(cloud);
+
+        auto* scalars = cloud->GetPointData() ? cloud->GetPointData()->GetScalars() : nullptr;
+        const bool hasRgb = (scalars && (scalars->GetNumberOfComponents() == 3 || scalars->GetNumberOfComponents() == 4));
+
+        if (hasRgb) {
+            mapper_->ScalarVisibilityOn();
+            mapper_->SetColorModeToDirectScalars();
+            mapper_->SetScalarModeToUsePointData();
+            actor_->GetProperty()->SetColor(1.0, 1.0, 1.0);
+        } else {
+            // fallback
+            mapper_->ScalarVisibilityOff();
+            actor_->GetProperty()->SetColor(0.9, 0.9, 0.9);
+        }
+        if (scalarBar_) scalarBar_->SetVisibility(0);
+        return;
+    }
+}
+
 void MainWindow::UpdateRender()
 {
     if (vtkWidget_ && vtkWidget_->renderWindow())
@@ -941,6 +1384,10 @@ void MainWindow::SetViewRaw(bool useRaw)
     else {
         if (processedCloud_) mapper_->SetInputData(processedCloud_);
     }
+    ApplyColorMappingForCurrentView();
+    UpdateAxesAndColor();
+    ApplyColorMappingForCurrentView();
+    UpdateAxesAndColor();
     UpdateRender();
 }
 
@@ -1003,7 +1450,8 @@ void MainWindow::ApplyScanQaAsync()
 
             if (viewCombo_) viewCombo_->setCurrentIndex(1); // Processed
             mapper_->SetInputData(processedCloud_);
-            mapper_->ScalarVisibilityOff();
+            ApplyColorMappingForCurrentView();
+            UpdateAxesAndColor();
 
             UpdateQaMetricsUI();
             UpdateRender();
@@ -1026,6 +1474,189 @@ void MainWindow::ApplyScanQaAsync()
 
     connect(th, &QThread::started, worker, &ScanQaWorker::run);
     th->start();
+}
+
+struct QaThresholds
+{
+    int minPoints = 30000;
+    double minPlaneInlierRatio = 0.25; // 0~1
+    double maxPlaneRmseMm = 3.0;
+    double maxOutlierRatio = 0.20; // 0~1
+};
+
+
+struct ParamRecD { double min=0.0; double max=0.0; QString unit; };
+struct ParamRecI { int min=0; int max=0; QString unit; };
+
+struct QaParamRecs
+{
+    ParamRecD voxelMm;
+    ParamRecD outlierR;
+    ParamRecI outlierMinN;
+    ParamRecD planeThr;
+    ParamRecI planeIter;
+};
+
+// Recommended ranges (tuning guidance). Adjust freely per your domain.
+static QaParamRecs GetParamRecs(bool inspectionMode)
+{
+    QaParamRecs r;
+    if (inspectionMode) {
+        r.voxelMm      = {0.30, 1.50, "mm"};
+        r.outlierR     = {0.50, 3.00, "mm"};
+        r.outlierMinN  = {8, 20, ""};
+        r.planeThr     = {0.50, 3.00, "mm"};
+        r.planeIter    = {300, 1500, ""};
+    } else {
+        r.voxelMm      = {0.50, 3.00, "mm"};
+        r.outlierR     = {1.00, 8.00, "mm"};
+        r.outlierMinN  = {4, 12, ""};
+        r.planeThr     = {1.00, 8.00, "mm"};
+        r.planeIter    = {150, 800, ""};
+    }
+    return r;
+}
+
+static QString HtmlValueBadge(const QString& text, const QString& bg, const QString& fg = "white")
+{
+    return QString("<span style='background:%1;color:%3;padding:1px 6px;border-radius:6px;font-weight:600;'>%2</span>")
+        .arg(bg, text.toHtmlEscaped(), fg);
+}
+
+static QString HtmlCurrentWithRec(double cur, const ParamRecD& rec, int prec = 2)
+{
+    const bool out = (cur < rec.min || cur > rec.max);
+    const QString curTxt = QString::number(cur, 'f', prec) + (rec.unit.isEmpty() ? "" : (" " + rec.unit));
+    const QString recTxt = QString("Recommended: %1–%2 %3")
+        .arg(rec.min, 0, 'f', prec)
+        .arg(rec.max, 0, 'f', prec)
+        .arg(rec.unit);
+    if (out) {
+        return QString("<span style='font-weight:700;color:#e74c3c;'>%1</span> <span style='opacity:0.85;'>(%2)</span>")
+            .arg(curTxt.toHtmlEscaped(), recTxt.toHtmlEscaped());
+    }
+    return QString("<span style='font-weight:700;'>%1</span> <span style='opacity:0.75;'>(%2)</span>")
+        .arg(curTxt.toHtmlEscaped(), recTxt.toHtmlEscaped());
+}
+
+static QString HtmlCurrentWithRecInt(int cur, const ParamRecI& rec)
+{
+    const bool out = (cur < rec.min || cur > rec.max);
+    const QString curTxt = QString::number(cur);
+    const QString recTxt = QString("Recommended: %1–%2").arg(rec.min).arg(rec.max);
+    if (out) {
+        return QString("<span style='font-weight:700;color:#e74c3c;'>%1</span> <span style='opacity:0.85;'>(%2)</span>")
+            .arg(curTxt.toHtmlEscaped(), recTxt.toHtmlEscaped());
+    }
+    return QString("<span style='font-weight:700;'>%1</span> <span style='opacity:0.75;'>(%2)</span>")
+        .arg(curTxt.toHtmlEscaped(), recTxt.toHtmlEscaped());
+}
+
+// Try to parse numeric hints from status text (fallback if last* metrics are unavailable)
+static void ParseMetricsFromStatusText(const QString& statusText, double& rmseMm, double& inlierRatio01, double& outlierRatio01)
+{
+    // RMSE: "RMSE 1.23 mm" or "RMSE = 1.23 mm"
+    QRegularExpression rxRmse(R"(RMSE\s*=?\s*([0-9]+(?:\.[0-9]+)?)\s*mm)", QRegularExpression::CaseInsensitiveOption);
+    auto m1 = rxRmse.match(statusText);
+    if (m1.hasMatch()) rmseMm = m1.captured(1).toDouble();
+
+    // inlier: "inlier 34.5%" or "inlier 34.5 %"
+    QRegularExpression rxInlier(R"(inlier\s*([0-9]+(?:\.[0-9]+)?)\s*%?)", QRegularExpression::CaseInsensitiveOption);
+    auto m2 = rxInlier.match(statusText);
+    if (m2.hasMatch()) inlierRatio01 = m2.captured(1).toDouble() / 100.0;
+
+    // outliers: "(12.3% outliers)" or "12.3% outliers"
+    QRegularExpression rxOut(R"(([0-9]+(?:\.[0-9]+)?)\s*%\s*outliers?)", QRegularExpression::CaseInsensitiveOption);
+    auto m3 = rxOut.match(statusText);
+    if (m3.hasMatch()) outlierRatio01 = m3.captured(1).toDouble() / 100.0;
+}
+
+
+struct QaEvalResult
+{
+    QString statusText;
+    QaFailReason reason = QaFailReason::None;
+    double outlierRatio = 0.0; // 0~1
+};
+
+static QaThresholds GetThresholds(bool inspectionMode)
+{
+    QaThresholds t;
+    if (inspectionMode) {
+        // Inspection(측정) 모드: 더 엄격한 기준 (초기값)
+        t.minPoints = 60000;
+        t.minPlaneInlierRatio = 0.35;
+        t.maxPlaneRmseMm = 1.50;
+        t.maxOutlierRatio = 0.10;
+    }
+    return t;
+}
+
+static QaEvalResult EvaluateScanQaDetailed(
+    vtkPolyData* cloud,
+    int removedOutlier,
+    int /*removedPlane*/,
+    double planeInlierRatio,
+    double planeRmseMm,
+    bool inspectionMode
+)
+{
+    QaEvalResult r;
+    const QaThresholds t = GetThresholds(inspectionMode);
+
+    if (!cloud) {
+        r.statusText = "FAIL: No cloud";
+        r.reason = QaFailReason::NoCloud;
+        return r;
+    }
+
+    const vtkIdType pointCount = cloud->GetNumberOfPoints();
+    if (pointCount < t.minPoints) {
+        r.statusText = "FAIL: Too few points";
+        r.reason = QaFailReason::TooFewPoints;
+        return r;
+    }
+
+    if (planeInlierRatio < t.minPlaneInlierRatio) {
+        r.statusText = QString("FAIL: Plane unstable (inlier %1%)")
+            .arg(planeInlierRatio * 100.0, 0, 'f', 1);
+        r.reason = QaFailReason::PlaneUnstable;
+        return r;
+    }
+
+    if (planeRmseMm > t.maxPlaneRmseMm) {
+        r.statusText = QString("FAIL: Plane noisy (RMSE %1 mm)")
+            .arg(planeRmseMm, 0, 'f', 2);
+        r.reason = QaFailReason::PlaneNoisy;
+        return r;
+    }
+
+    // NOTE: removedOutlier는 processed에서 제거된 포인트 수.
+    // outlierRatio는 (제거된 수 / (원래 수))에 가까운 근사치로 계산.
+    r.outlierRatio = (double)removedOutlier / (double)(pointCount + removedOutlier);
+
+    if (r.outlierRatio > t.maxOutlierRatio) {
+        r.statusText = QString("FAIL: Excessive noise (%1% outliers)")
+            .arg(r.outlierRatio * 100.0, 0, 'f', 1);
+        r.reason = QaFailReason::ExcessiveNoise;
+        return r;
+    }
+
+    r.statusText = "PASS: Scan usable for next step";
+    r.reason = QaFailReason::None;
+    return r;
+}
+
+static QString EvaluateScanQa(
+    vtkPolyData* cloud,
+    int removedOutlier,
+    int removedPlane,
+    double planeInlierRatio,
+    double planeRmseMm,
+    bool inspectionMode
+)
+{
+    return EvaluateScanQaDetailed(cloud, removedOutlier, removedPlane, planeInlierRatio, planeRmseMm, inspectionMode).statusText;
 }
 
 void MainWindow::UpdateQaMetricsUI()
@@ -1068,4 +1699,399 @@ void MainWindow::UpdateQaMetricsUI()
     if (qaRemovedPlaneLabel_) qaRemovedPlaneLabel_->setText(QString::number(lastRemovedPlane_));
     if (qaPlaneInlierLabel_) qaPlaneInlierLabel_->setText(QString("%1 %").arg(lastPlaneInlierRatio_ * 100.0, 0, 'f', 1));
     if (qaPlaneRmseLabel_) qaPlaneRmseLabel_->setText(QString::number(lastPlaneRmseMm_, 'f', 3));
+
+    // --- Quality Judgment ---
+    bool inspectionMode = (workspaceCombo_ && workspaceCombo_->currentIndex() == 1);
+
+    QaEvalResult eval = EvaluateScanQaDetailed(
+        cloud,
+        lastRemovedOutlier_,
+        lastRemovedPlane_,
+        lastPlaneInlierRatio_,
+        lastPlaneRmseMm_,
+        inspectionMode
+    );
+
+    lastQaReason_ = eval.reason;
+    lastOutlierRatio_ = eval.outlierRatio;
+    lastQaStatusText_ = eval.statusText;
+
+    qaStatusLabel_->setText(eval.statusText);
+
+    // 색상으로 직관적 표시
+    if (eval.statusText.startsWith("PASS")) {
+        qaStatusLabel_->setStyleSheet("color: #2ecc71; font-weight: bold;");
+    }
+    else {
+        qaStatusLabel_->setStyleSheet("color: #e74c3c; font-weight: bold;");
+    }
+}
+
+
+void MainWindow::installHelp(QObject* w, const QString& text)
+{
+    if (!w) return;
+    helpMap_[w] = text;
+
+    // Tooltip도 같이 달기(짧게/핵심만)
+    if (auto* qw = qobject_cast<QWidget*>(w)) {
+        //qw->setToolTip(text);
+        qw->installEventFilter(this);
+    }
+}
+
+static inline double stdevFromSumSq(int n, double sum, double sumSq)
+{
+    if (n <= 1) return 0.0;
+    const double mean = sum / double(n);
+    const double var = std::max(0.0, (sumSq / double(n)) - mean * mean);
+    return std::sqrt(var);
+}
+
+void MainWindow::InstallQaCriteriaHelp()
+{
+    if (!qaStatusLabel_) return;
+
+    // Hover 시에는 간단한 안내, 클릭 시에는 QA 기준/원인/권장 튜닝을 상세 표시
+    helpMap_[qaStatusLabel_] =
+        "<b>QA Status</b><br>"
+        "• Shows PASS/FAIL based on Scan QA criteria.<br>"
+        "• <b>Click</b> to open detailed criteria + tuning guide.";
+
+    qaStatusLabel_->setCursor(Qt::PointingHandCursor);
+    qaStatusLabel_->installEventFilter(this);
+}
+
+void MainWindow::FlashWidget(QWidget* w, int ms)
+{
+    if (!w) return;
+
+    const QString old = w->styleSheet();
+    w->setStyleSheet(old + "border: 2px solid #ffcc00; border-radius: 4px;");
+    QTimer::singleShot(ms, w, [w, old]() {
+        if (w) w->setStyleSheet(old);
+    });
+}
+
+QString MainWindow::BuildQaCriteriaHelpHtml(QaFailReason reason, const QString& statusText) const
+{
+    const bool inspectionMode = (workspaceCombo_ && workspaceCombo_->currentIndex() == 1);
+    const QaThresholds t = GetThresholds(inspectionMode);
+
+    auto fmtPct = [](double v01) { return QString("%1 %").arg(v01 * 100.0, 0, 'f', 1); };
+    auto badge = [](const QString& txt, const QString& bg) {
+        return QString("<span style='background:%1;color:white;padding:2px 6px;border-radius:6px;font-weight:600;'>%2</span>").arg(bg, txt);
+    };
+
+    const QString modeName = inspectionMode ? "Inspection(측정)" : "Pick/Scan QA";
+
+    const QString statusBadge =
+        statusText.startsWith("PASS") ? badge("PASS", "#2ecc71") :
+        statusText.startsWith("FAIL") ? badge("FAIL", "#e74c3c") :
+        badge("INFO", "#3498db");
+
+    
+// 현재 측정값 (우선 last* 값 사용, 없으면 statusText에서 보조 파싱)
+const QString curPoints = qaPointCountLabel_ ? qaPointCountLabel_->text() : "-";
+
+double curInlier = lastPlaneInlierRatio_;
+double curRmse = lastPlaneRmseMm_;
+double curOutlier = lastOutlierRatio_;
+
+// fallback: statusText 안에 수치가 들어있는 경우(예: "RMSE 1.2 mm", "inlier 30%")
+if ((curRmse <= 0.0 || curInlier <= 0.0 || curOutlier <= 0.0) && !statusText.isEmpty()) {
+    ParseMetricsFromStatusText(statusText, curRmse, curInlier, curOutlier);
+}
+
+const QaParamRecs recs = GetParamRecs(inspectionMode);
+
+auto passFail = [](bool ok) {
+    return ok ? "<span style='color:#2ecc71;font-weight:700;'>OK</span>"
+              : "<span style='color:#e74c3c;font-weight:700;'>FAIL</span>";
+};
+    const bool okPoints = (curPoints.toLongLong() >= t.minPoints);
+    const bool okInlier = (curInlier >= t.minPlaneInlierRatio);
+    const bool okRmse = (curRmse <= t.maxPlaneRmseMm);
+    const bool okOutlier = (curOutlier <= t.maxOutlierRatio);
+
+    QString why;
+    QString related;
+
+    switch (reason) {
+    case QaFailReason::TooFewPoints:
+        why = "Point count is below minimum. Acquisition may be insufficient or voxel too large.";
+        related = "Voxel (mm), acquisition settings";
+        break;
+    case QaFailReason::PlaneUnstable:
+        why = "Plane inlier ratio is too low. Plane model is not stable.";
+        related = "Plane Thr, Plane Iter, Voxel";
+        break;
+    case QaFailReason::PlaneNoisy:
+        why = "Plane RMSE is too high. Scene/plane is noisy or threshold is not appropriate.";
+        related = "Plane Thr, Outlier R/MinN, Voxel";
+        break;
+    case QaFailReason::ExcessiveNoise:
+        why = "Outlier ratio is too high. Noise points remain after filtering.";
+        related = "Outlier R, Outlier MinN, Voxel";
+        break;
+    case QaFailReason::NoCloud:
+        why = "No cloud loaded. Load a PLY first.";
+        related = "Load PLY";
+        break;
+    default:
+        why = "Criteria summary for the current status.";
+        related = "—";
+        break;
+    }
+
+    // 파라미터 현재값 표시(있을 때만)
+    auto curSpin = [](const QDoubleSpinBox* s)->QString {
+        if (!s) return "-";
+        return QString::number(s->value(), 'f', 2) + " mm";
+    };
+    auto curSpinI = [](const QSpinBox* s)->QString {
+        if (!s) return "-";
+        return QString::number(s->value());
+    };
+
+    
+const double curVoxelVal = voxelMmSpin_ ? voxelMmSpin_->value() : 0.0;
+const double curOutlierRVal = outlierRadiusSpin_ ? outlierRadiusSpin_->value() : 0.0;
+const int curMinNVal = outlierMinNbSpin_ ? outlierMinNbSpin_->value() : 0;
+const double curPlaneThrVal = planeThresholdSpin_ ? planeThresholdSpin_->value() : 0.0;
+const int curPlaneIterVal = planeIterSpin_ ? planeIterSpin_->value() : 0;
+
+// with recommended-range 강조 표시
+const QString curVoxel = voxelMmSpin_ ? HtmlCurrentWithRec(curVoxelVal, recs.voxelMm, 2) : "-";
+const QString curOR = outlierRadiusSpin_ ? HtmlCurrentWithRec(curOutlierRVal, recs.outlierR, 2) : "-";
+const QString curMinN = outlierMinNbSpin_ ? HtmlCurrentWithRecInt(curMinNVal, recs.outlierMinN) : "-";
+const QString curThr = planeThresholdSpin_ ? HtmlCurrentWithRec(curPlaneThrVal, recs.planeThr, 2) : "-";
+const QString curIter = planeIterSpin_ ? HtmlCurrentWithRecInt(curPlaneIterVal, recs.planeIter) : "-";
+
+    QString html;
+    html += QString("<h3 style='margin:0 0 6px 0;'>QA Criteria (%1)</h3>").arg(modeName);
+    html += QString("<div style='margin:0 0 8px 0;'>Status: %1 &nbsp; <span style='opacity:0.85;'>%2</span></div>")
+        .arg(statusBadge, statusText.toHtmlEscaped());
+
+    html += "<hr style='border:0;border-top:1px solid #333;margin:8px 0;'>";
+
+    html += "<b>Criteria</b><br>";
+    html += "<table style='width:100%;border-collapse:collapse;'>"
+            "<tr><th align='left'>Item</th><th align='left'>Current</th><th align='left'>Threshold</th><th align='left'>Result</th></tr>";
+
+    html += QString("<tr><td>Points</td><td>%1</td><td>≥ %2</td><td>%3</td></tr>")
+        .arg(curPoints.toHtmlEscaped())
+        .arg(t.minPoints)
+        .arg(passFail(okPoints));
+
+    html += QString("<tr><td>Plane inlier</td><td>%1</td><td>≥ %2%</td><td>%3</td></tr>")
+        .arg(fmtPct(curInlier))
+        .arg(t.minPlaneInlierRatio * 100.0, 0, 'f', 1)
+        .arg(passFail(okInlier));
+
+    html += QString("<tr><td>Plane RMSE</td><td>%1 mm</td><td>≤ %2 mm</td><td>%3</td></tr>")
+        .arg(curRmse, 0, 'f', 3)
+        .arg(t.maxPlaneRmseMm, 0, 'f', 2)
+        .arg(passFail(okRmse));
+
+    html += QString("<tr><td>Outlier ratio</td><td>%1</td><td>≤ %2%</td><td>%3</td></tr>")
+        .arg(fmtPct(curOutlier))
+        .arg(t.maxOutlierRatio * 100.0, 0, 'f', 1)
+        .arg(passFail(okOutlier));
+
+    html += "</table>";
+
+    html += "<hr style='border:0;border-top:1px solid #333;margin:10px 0;'>";
+
+    html += QString("<b>Why</b><br><span style='opacity:0.9;'>%1</span><br>").arg(why.toHtmlEscaped());
+
+    html += "<br><b>Suggested tuning</b><br>";
+    
+html += "<ul style='margin-top:6px;'>";
+auto dirD = [](double cur, double mn, double mx)->QString {
+    if (cur <= 0.0) return "—";
+    if (cur < mn) return "↑ increase";
+    if (cur > mx) return "↓ decrease";
+    return "fine-tune";
+};
+auto dirI = [](int cur, int mn, int mx)->QString {
+    if (cur <= 0) return "—";
+    if (cur < mn) return "↑ increase";
+    if (cur > mx) return "↓ decrease";
+    return "fine-tune";
+};
+
+if (reason == QaFailReason::PlaneUnstable) {
+    html += QString("<li><b>Plane Iter</b>: %1 (Recommended %2–%3)</li>")
+        .arg(dirI(curPlaneIterVal, recs.planeIter.min, recs.planeIter.max).toHtmlEscaped())
+        .arg(recs.planeIter.min).arg(recs.planeIter.max);
+
+    html += QString("<li><b>Plane Thr</b>: %1 (Recommended %2–%3 mm)</li>")
+        .arg(dirD(curPlaneThrVal, recs.planeThr.min, recs.planeThr.max).toHtmlEscaped())
+        .arg(recs.planeThr.min, 0, 'f', 2).arg(recs.planeThr.max, 0, 'f', 2);
+
+    // heuristic: if inlier low, slightly increase threshold within range
+    if (curInlier > 0.0 && curInlier < t.minPlaneInlierRatio) {
+        html += "<li>Low inlier ratio → try <b>slightly increasing Plane Thr</b> (within recommended range) to gather more inliers.</li>";
+    }
+    html += "<li>If you still have too few inliers, consider a smaller <b>Voxel</b> (more points, slower).</li>";
+}
+else if (reason == QaFailReason::PlaneNoisy) {
+    html += "<li>Plane RMSE is high → focus on stabilizing the plane and removing noise.</li>";
+
+    html += QString("<li><b>Outlier R</b>: %1 (Recommended %2–%3 mm)</li>")
+        .arg(dirD(curOutlierRVal, recs.outlierR.min, recs.outlierR.max).toHtmlEscaped())
+        .arg(recs.outlierR.min, 0, 'f', 2).arg(recs.outlierR.max, 0, 'f', 2);
+
+    html += QString("<li><b>Outlier MinN</b>: %1 (Recommended %2–%3)</li>")
+        .arg(dirI(curMinNVal, recs.outlierMinN.min, recs.outlierMinN.max).toHtmlEscaped())
+        .arg(recs.outlierMinN.min).arg(recs.outlierMinN.max);
+
+    // heuristic about plane thr direction using rmse and current thr
+    if (curPlaneThrVal > 0.0) {
+        if (curPlaneThrVal > recs.planeThr.max) {
+            html += "<li><b>Plane Thr</b> is high → try <b>decreasing</b> it to avoid fitting noise as plane.</li>";
+        } else if (curPlaneThrVal < recs.planeThr.min) {
+            html += "<li><b>Plane Thr</b> is very low → try <b>increasing</b> it slightly to get stable inliers.</li>";
+        } else {
+            html += "<li><b>Plane Thr</b> is in range → fine-tune in small steps (±0.2–0.5 mm).</li>";
+        }
+    }
+}
+else if (reason == QaFailReason::ExcessiveNoise) {
+    html += "<li>Outlier ratio is high → strengthen outlier filtering first.</li>";
+
+    html += QString("<li><b>Outlier R</b>: %1 (Recommended %2–%3 mm)</li>")
+        .arg(dirD(curOutlierRVal, recs.outlierR.min, recs.outlierR.max).toHtmlEscaped())
+        .arg(recs.outlierR.min, 0, 'f', 2).arg(recs.outlierR.max, 0, 'f', 2);
+
+    html += QString("<li><b>Outlier MinN</b>: %1 (Recommended %2–%3)</li>")
+        .arg(dirI(curMinNVal, recs.outlierMinN.min, recs.outlierMinN.max).toHtmlEscaped())
+        .arg(recs.outlierMinN.min).arg(recs.outlierMinN.max);
+
+    if (curOutlier > 0.0 && curOutlier > t.maxOutlierRatio) {
+        html += "<li>If noise persists, consider slightly reducing <b>Voxel</b> (more points) only when necessary.</li>";
+    }
+}
+else if (reason == QaFailReason::TooFewPoints) {
+    html += "<li>Point count is low → acquisition density or voxel setting is the main suspect.</li>";
+
+    html += QString("<li><b>Voxel</b>: %1 (Recommended %2–%3 mm)</li>")
+        .arg(dirD(curVoxelVal, recs.voxelMm.min, recs.voxelMm.max).toHtmlEscaped())
+        .arg(recs.voxelMm.min, 0, 'f', 2).arg(recs.voxelMm.max, 0, 'f', 2);
+
+    html += "<li>If possible, re-scan with higher density / better exposure to increase points.</li>";
+}
+else if (reason == QaFailReason::NoCloud) {
+    html += "<li>Load a PLY and run <b>Apply Scan QA</b>.</li>";
+}
+else {
+    html += "<li>Run <b>Apply Scan QA</b>, then click the PASS/FAIL status to see criteria-specific guidance.</li>";
+}
+html += "</ul>";
+
+
+    html += "<b>Related parameters</b><br>";
+    html += QString("<span style='opacity:0.9;'>%1</span><br>").arg(related.toHtmlEscaped());
+
+    html += "<br><b>Current parameters</b><br>";
+    html += "<table style='width:100%;border-collapse:collapse;'>"
+            "<tr><td>Voxel</td><td>" + curVoxel + "</td></tr>"
+            "<tr><td>Outlier R</td><td>" + curOR + "</td></tr>"
+            "<tr><td>Outlier MinN</td><td>" + curMinN + "</td></tr>"
+            "<tr><td>Plane Thr</td><td>" + curThr + "</td></tr>"
+            "<tr><td>Plane Iter</td><td>" + curIter + "</td></tr>"
+            "</table>";
+
+    html += "<div style='margin-top:8px;opacity:0.75;'>Tip: Run <b>Apply Scan QA</b> again after tuning.</div>";
+
+    return html;
+}
+
+void MainWindow::ShowQaCriteriaHelp()
+{
+    if (!helpLabel_) return;
+
+    // 클릭할 때마다 pin 토글: 고정되어 있으면 해제, 아니면 고정
+    if (qaHelpPinned_) {
+        qaHelpPinned_ = false;
+        return;
+    }
+
+    qaHelpPinned_ = true;
+    qaPinnedHtml_ = BuildQaCriteriaHelpHtml(lastQaReason_, lastQaStatusText_);
+
+    // Add a small pinned badge (click help panel to unpin)
+    qaPinnedHtml_ = QString("<div style='display:flex;align-items:center;gap:6px;padding:4px 6px;margin-bottom:6px;border-radius:6px;background:#f2f2f2;'><span>📌</span><b>Pinned</b><span style='opacity:0.75'>(click this panel to unpin)</span></div>") + qaPinnedHtml_;
+
+    helpLabel_->setHtml(qaPinnedHtml_);
+    helpLabel_->moveCursor(QTextCursor::Start);
+
+    // 해당 FAIL 사유에 맞는 파라미터를 살짝 강조(시각적 힌트)
+    switch (lastQaReason_) {
+    case QaFailReason::PlaneUnstable:
+        FlashWidget(planeThresholdSpin_);
+        FlashWidget(planeIterSpin_);
+        break;
+    case QaFailReason::PlaneNoisy:
+        FlashWidget(planeThresholdSpin_);
+        FlashWidget(outlierRadiusSpin_);
+        FlashWidget(outlierMinNbSpin_);
+        break;
+    case QaFailReason::ExcessiveNoise:
+        FlashWidget(outlierRadiusSpin_);
+        FlashWidget(outlierMinNbSpin_);
+        break;
+    case QaFailReason::TooFewPoints:
+        FlashWidget(voxelMmSpin_);
+        break;
+    default:
+        break;
+    }
+}
+
+bool MainWindow::eventFilter(QObject* obj, QEvent* event)
+{
+    // Help 패널 클릭 → QA 도움말 고정 해제
+    if (obj == helpLabel_ && event->type() == QEvent::MouseButtonRelease) {
+        qaHelpPinned_ = false;
+        return false;
+    }
+
+    // QA Status 클릭 → QA 판정 기준/원인/권장 튜닝 표시
+    if (obj == qaStatusLabel_ && event->type() == QEvent::MouseButtonRelease) {
+        ShowQaCriteriaHelp();
+        return true;
+    }
+
+
+    // QA 도움말이 pin 상태일 때: 특정 파라미터(위젯)를 클릭하면 해당 파라미터 도움말로 전환 (pin 해제)
+    if (qaHelpPinned_ && event->type() == QEvent::MouseButtonRelease) {
+        if (helpLabel_ && obj != helpLabel_ && obj != qaStatusLabel_ && helpMap_.contains(obj)) {
+            qaHelpPinned_ = false;
+            const QString html = helpMap_.value(obj);
+            helpLabel_->setHtml(html);
+            helpLabel_->moveCursor(QTextCursor::Start);
+            return true;
+        }
+    }
+
+    // 마우스 오버 또는 포커스 들어올 때 설명 갱신
+    if (event->type() == QEvent::Enter || event->type() == QEvent::FocusIn) {
+        if (helpLabel_ && helpMap_.contains(obj)) {
+            const QString html = helpMap_.value(obj);
+
+            // QA 기준 도움말이 pin 상태면, Help 패널은 유지하고 Hover 내용은 툴팁으로만 띄운다
+            if (qaHelpPinned_) {
+                if (auto* w = qobject_cast<QWidget*>(obj)) {
+                    QToolTip::showText(QCursor::pos(), HtmlToPlainText(html), w);
+                }
+            }
+            else {
+                helpLabel_->setHtml(html);
+                helpLabel_->moveCursor(QTextCursor::Start);
+            }
+        }
+    }
+    return QMainWindow::eventFilter(obj, event);
 }
