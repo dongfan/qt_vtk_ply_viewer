@@ -196,7 +196,7 @@ private:
 #include <vtkIdList.h>
 
 namespace {
-
+    
     // -------------------- Safe PLY Loader (binary_little_endian; point cloud) --------------------
     static vtkSmartPointer<vtkPolyData> LoadPlySafe_PCLBinary_Progress(
         const std::string& path,
@@ -583,6 +583,58 @@ namespace {
 
 } // namespace
 
+struct InspectionResult
+{
+    double minZ = 0.0;
+    double maxZ = 0.0;
+    double meanZ = 0.0;
+    double stdZ = 0.0;
+    vtkSmartPointer<vtkPolyData> coloredCloud;
+};
+
+static InspectionResult ComputeHeightFromPlane(
+    vtkPolyData* cloud,
+    double nx, double ny, double nz, double d
+)
+{
+    InspectionResult r;
+    if (!cloud || !cloud->GetPoints()) return r;
+
+    vtkNew<vtkFloatArray> heightArr;
+    heightArr->SetName("Height(mm)");
+    heightArr->SetNumberOfComponents(1);
+
+    double minZ = 1e9;
+    double maxZ = -1e9;
+    double sum = 0.0;
+    double sumSq = 0.0;
+
+    const vtkIdType N = cloud->GetNumberOfPoints();
+    double p[3];
+
+    for (vtkIdType i = 0; i < N; ++i) {
+        cloud->GetPoint(i, p);
+        const double h = nx * p[0] + ny * p[1] + nz * p[2] + d;
+
+        heightArr->InsertNextValue(h);
+        minZ = std::min(minZ, h);
+        maxZ = std::max(maxZ, h);
+        sum += h;
+        sumSq += h * h;
+    }
+
+    r.minZ = minZ;
+    r.maxZ = maxZ;
+    r.meanZ = sum / N;
+    r.stdZ = std::sqrt(std::max(0.0, sumSq / N - r.meanZ * r.meanZ));
+
+    vtkSmartPointer<vtkPolyData> out = vtkSmartPointer<vtkPolyData>::New();
+    out->ShallowCopy(cloud);
+    out->GetPointData()->SetScalars(heightArr);
+
+    r.coloredCloud = out;
+    return r;
+}
 // -------------------- PlyLoadWorker --------------------
 void PlyLoadWorker::run()
 {
@@ -649,6 +701,9 @@ void ScanQaWorker::run()
             double nx, ny, nz, d;
             PlaneRansac(cur, planeThresholdMm, planeIterations, inliers, nx, ny, nz, d);
 
+            PlaneRansac(cur, planeThresholdMm, planeIterations, inliers,
+                outPlaneNx, outPlaneNy, outPlaneNz, outPlaneD);
+
             const vtkIdType N = cur->GetNumberOfPoints();
             planeInlierRatio = (N > 0) ? ((double)inliers.size() / (double)N) : 0.0;
             planeRmseMm = PlaneRmse(cur, inliers, nx, ny, nz, d);
@@ -665,7 +720,11 @@ void ScanQaWorker::run()
 
         vtkPolyData* raw = cur.GetPointer();
         raw->Register(nullptr);
-        emit finished(raw, removedOutlier, removedPlane, planeInlierRatio, planeRmseMm);
+        emit finished(raw, removedOutlier, removedPlane, planeInlierRatio, planeRmseMm,
+            outPlaneNx,
+            outPlaneNy,
+            outPlaneNz,
+            outPlaneD);
 
         emit progress(100);
     }
@@ -688,6 +747,8 @@ static QString HtmlToPlainText(const QString& html)
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
+    currentMode_ = AppMode::Pick;
+
     setWindowTitle("Qt + VTK PLY Viewer");
     resize(1200, 850);
     setAcceptDrops(true);
@@ -913,6 +974,7 @@ void MainWindow::CreateDockUI()
         form->addRow("Plane:", planeRow);
 
         // Apply
+        currentMode_ = AppMode::Inspection;
         applyQaBtn_ = new QPushButton("Apply Scan QA", page);
         form->addRow(applyQaBtn_);
         connect(applyQaBtn_, &QPushButton::clicked, this, [this]() {
@@ -1005,9 +1067,32 @@ void MainWindow::CreateDockUI()
     {
         auto* page = new QWidget(panel);
         auto* pv = new QVBoxLayout(page);
-        pv->addWidget(new QLabel("Inspection workspace: (next step) Align + Measure tools", page));
+
+        auto* group = new QGroupBox("Inspection – Height from Reference Plane", page);
+        auto* form = new QFormLayout(group);
+
+        inspRunBtn_ = new QPushButton("Run Inspection", page);
+        form->addRow(inspRunBtn_);
+
+        inspMinLabel_ = new QLabel("-", page);
+        inspMaxLabel_ = new QLabel("-", page);
+        inspMeanLabel_ = new QLabel("-", page);
+        inspStdLabel_ = new QLabel("-", page);
+
+        form->addRow("Min Height (mm):", inspMinLabel_);
+        form->addRow("Max Height (mm):", inspMaxLabel_);
+        form->addRow("Mean Height (mm):", inspMeanLabel_);
+        form->addRow("Std Dev (mm):", inspStdLabel_);
+
+        group->setLayout(form);
+        pv->addWidget(group);
         pv->addStretch(1);
+
         workspaceStack_->addWidget(page);
+
+        connect(inspRunBtn_, &QPushButton::clicked, this, [this]() {
+            RunInspection();
+            });
     }
 
     // -------------------- Page 2: Robot Pose (placeholder) --------------------
@@ -1435,7 +1520,8 @@ void MainWindow::ApplyScanQaAsync()
         }, Qt::QueuedConnection);
 
     connect(worker, &ScanQaWorker::finished, this,
-        [=](vtkPolyData* outRaw, int removedOut, int removedPlane, double inlierRatio, double rmseMm)
+        [=](vtkPolyData* outRaw, int removedOut, int removedPlane, double inlierRatio, double rmseMm,
+            double nx, double ny, double nz, double d)
         {
             if (dlg) { dlg->setValue(100); dlg->close(); dlg->deleteLater(); }
 
@@ -1447,6 +1533,11 @@ void MainWindow::ApplyScanQaAsync()
             lastRemovedPlane_ = removedPlane;
             lastPlaneInlierRatio_ = inlierRatio;
             lastPlaneRmseMm_ = rmseMm;
+
+            lastPlaneNx_ = nx;
+            lastPlaneNy_ = ny;
+            lastPlaneNz_ = nz;
+            lastPlaneD_ = d;
 
             if (viewCombo_) viewCombo_->setCurrentIndex(1); // Processed
             mapper_->SetInputData(processedCloud_);
@@ -1727,17 +1818,43 @@ void MainWindow::UpdateQaMetricsUI()
     }
 }
 
-
-void MainWindow::installHelp(QObject* w, const QString& text)
+void MainWindow::refreshAllHelp()
 {
-    if (!w) return;
-    helpMap_[w] = text;
+    installHelp(voxelMmSpin_, "voxel_mm");
+    installHelp(outlierRadiusSpin_, "outlier_radius");
+    installHelp(outlierMinNbSpin_,"outlier_min_neighbors");
+    installHelp(planeThresholdSpin_,"plane_threshold");
 
-    // Tooltip도 같이 달기(짧게/핵심만)
-    if (auto* qw = qobject_cast<QWidget*>(w)) {
-        //qw->setToolTip(text);
-        qw->installEventFilter(this);
-    }
+    installHelp(planeIterSpin_,
+        "<b>Iter – RANSAC Iterations</b><br>"
+        "• Number of random plane hypotheses tested.<br><br>"
+        "• <b>Higher value</b>: better chance to find dominant plane<br>"
+        "• <b>Lower value</b>: faster, but may miss correct plane<br><br>"
+        "<i>Typical:</i> 200 – 2000<br>"
+        "<i>Tip:</i> Increase for complex scenes or low inlier ratios."
+    );
+
+    installHelp(planeRemoveEnable_,
+        "<b>Remove Plane</b><br>"
+        "• Removes detected plane inlier points (e.g., table or floor).<br><br>"
+        "• <b>ON</b>: isolate objects for picking / inspection<br>"
+        "• <b>OFF</b>: visualize plane quality without removal<br><br>"
+        "<i>Recommended:</i> ON for picking, OFF for QA tuning"
+    );
+}
+
+void MainWindow::installHelp(QWidget* w, const QString& helpKey)
+{
+    const auto& help = ParameterHelpDB::get(helpKey, currentMode_);
+
+    QString text =
+        help.title + "\n\n" +
+        help.description + "\n\n" +
+        "Recommended:\n" + help.recommended + "\n\n" +
+        "Caution:\n" + help.caution;
+
+    // 기존 tooltip / help dialog 로직 그대로
+    w->setToolTip(text);
 }
 
 static inline double stdevFromSumSq(int n, double sum, double sumSq)
@@ -2094,4 +2211,36 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         }
     }
     return QMainWindow::eventFilter(obj, event);
+}
+
+
+void MainWindow::RunInspection()
+{
+    if (!processedCloud_) {
+        QMessageBox::information(this, "Inspection", "Run Scan QA first.");
+        return;
+    }
+
+    InspectionResult res = ComputeHeightFromPlane(
+        processedCloud_,
+        lastPlaneNx_, lastPlaneNy_, lastPlaneNz_, lastPlaneD_
+    );
+
+    inspMinLabel_->setText(QString::number(res.minZ, 'f', 3));
+    inspMaxLabel_->setText(QString::number(res.maxZ, 'f', 3));
+    inspMeanLabel_->setText(QString::number(res.meanZ, 'f', 3));
+    inspStdLabel_->setText(QString::number(res.stdZ, 'f', 3));
+
+    // 시각화
+    mapper_->SetInputData(res.coloredCloud);
+    mapper_->SetLookupTable(lutJet_);
+    mapper_->SetScalarRange(res.minZ, res.maxZ);
+    mapper_->ScalarVisibilityOn();
+
+    if (scalarBar_) {
+        scalarBar_->SetTitle("Height (mm)");
+        scalarBar_->SetVisibility(1);
+    }
+
+    UpdateRender();
 }

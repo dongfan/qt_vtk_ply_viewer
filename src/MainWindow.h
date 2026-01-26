@@ -1,4 +1,5 @@
 #pragma once
+#include "ParameterHelp.h"
 
 #include <QMainWindow>
 #include <QObject>
@@ -24,7 +25,6 @@ enum class QaFailReason
     ExcessiveNoise,
     Unknown
 };
-
 
 #include <vtkSmartPointer.h>
 
@@ -71,6 +71,13 @@ public slots:
 class ScanQaWorker : public QObject
 {
     Q_OBJECT
+
+private:
+    double outPlaneNx = 0.0;
+    double outPlaneNy = 0.0;
+    double outPlaneNz = 1.0;
+    double outPlaneD = 0.0;
+
 public:
     vtkSmartPointer<vtkPolyData> input;
 
@@ -100,7 +107,8 @@ signals:
         int removedOutlier,
         int removedPlane,
         double planeInlierRatio,
-        double planeRmseMm);
+        double planeRmseMm,
+        double nx, double ny, double nz, double d);
 
     void failed(QString msg);
 
@@ -123,6 +131,7 @@ protected:
 
 private:
     void CreateDockUI();
+    void refreshAllHelp();
 
     // Data / actions
     void LoadPLYAsync(const QString& path);
@@ -136,7 +145,7 @@ private:
     void SetViewRaw(bool useRaw);
     void UpdateQaMetricsUI();
 
-    void installHelp(QObject* w, const QString& text);
+    void installHelp(QWidget* w, const QString& text);
 
     // QA criteria help linkage
     void InstallQaCriteriaHelp();
@@ -144,16 +153,16 @@ private:
     QString BuildQaCriteriaHelpHtml(QaFailReason reason, const QString& statusText) const;
     void FlashWidget(QWidget* w, int ms = 650);
 
-    // XYZ graph dock
-    void InstallXyzGraph();
-    void UpdateXyzGraph();
-
     // Coordinate axes + color mapping (VTK)
     void InstallAxesAndColor();
     void UpdateAxesAndColor();
     void ApplyColorMappingForCurrentView();
 
+    void RunInspection();
+
 private:
+    AppMode currentMode_ = AppMode::Pick;
+
     // VTK view
     QVTKOpenGLNativeWidget* vtkWidget_ = nullptr;
 
@@ -245,4 +254,19 @@ private:
 
     // help map (widget -> text)
     QHash<const QObject*, QString> helpMap_;
+
+    // ===== Inspection UI =====
+    QPushButton* inspRunBtn_ = nullptr;
+
+    QLabel* inspMinLabel_ = nullptr;
+    QLabel* inspMaxLabel_ = nullptr;
+    QLabel* inspMeanLabel_ = nullptr;
+    QLabel* inspStdLabel_ = nullptr;
+
+    // ===== Last plane (from Scan QA) =====
+    double lastPlaneNx_ = 0.0;
+    double lastPlaneNy_ = 0.0;
+    double lastPlaneNz_ = 1.0;
+    double lastPlaneD_ = 0.0;
+
 };
